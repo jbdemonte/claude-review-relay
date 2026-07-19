@@ -1,46 +1,46 @@
 # Claude Reviewer MCP
 
-Serveur MCP local en Go qui permet à Codex de confier la revue d’un diff Git à
-Claude Code en lecture seule. Chaque `review_id` est associé durablement au
-`session_id` explicite de Claude. Les suivis utilisent exclusivement
-`claude -p --resume <session_id>` : l’option ambiguë `--continue` n’est jamais
-utilisée.
+A local Go MCP server that lets Codex delegate Git diff reviews to Claude Code
+in read-only mode. Each `review_id` is durably associated with an explicit
+Claude `session_id`. Follow-ups exclusively use
+`claude -p --resume <session_id>`; the ambiguous `--continue` option is never
+used.
 
-## Garanties principales
+## Core Guarantees
 
-- transport MCP STDIO, avec stdout réservé au protocole et logs JSON sur stderr ;
-- cinq outils : `review_diff`, `continue_review`, `get_review`, `list_reviews`,
-  `close_review` ;
-- annotations MCP explicites : lectures marquées read-only, fermeture marquée
-  destructive, afin que les politiques d’approbation Codex soient correctes ;
-- diff calculé localement par arguments Git séparés, sans shell ni commande
-  destructive ;
-- Claude limité à `Read,Glob,Grep`, avec écriture, Bash, Web et outils MCP
-  interdits ;
-- prompt et diff transmis à Claude par stdin, jamais dans la ligne de commande
-  visible par `ps` et sans dépendre de la limite macOS `ARG_MAX` ;
-- réponses imposées par JSON Schema puis validées côté Go ;
-- sessions dans `~/Library/Application Support/claude-reviewer/sessions.json`,
-  écrites atomiquement avec `Sync`, renommage et permissions `0600` ;
-- verrou non bloquant par revue (`review_busy`) ; les autres revues restent
-  parallélisables ;
-- limite de diff de 2 Mio par défaut, jamais tronqué silencieusement ;
-- exclusion des noms de fichiers sensibles, redaction de tokens courants et
-  refus d’une clé privée complète.
+- MCP over STDIO, with stdout reserved for the protocol and JSON logs on stderr;
+- five tools: `review_diff`, `continue_review`, `get_review`, `list_reviews`,
+  and `close_review`;
+- explicit MCP annotations: reads are marked read-only and closing is marked
+  destructive so Codex approval policies behave correctly;
+- diffs are computed locally with separate Git arguments, without a shell or
+  destructive commands;
+- Claude is limited to `Read,Glob,Grep`; writing, Bash, Web, and MCP tools are
+  forbidden;
+- the prompt and diff are sent to Claude through stdin, never on the command
+  line visible through `ps`, and do not depend on the macOS `ARG_MAX` limit;
+- responses are constrained by JSON Schema and then validated in Go;
+- sessions are stored in
+  `~/Library/Application Support/claude-reviewer/sessions.json`, written
+  atomically with `Sync`, rename, and `0600` permissions;
+- each review has a non-blocking lock (`review_busy`), while other reviews can
+  run concurrently;
+- the default diff limit is 2 MiB and is never silently truncated;
+- sensitive filenames are excluded, common tokens are redacted, and complete
+  private keys cause the review to be rejected.
 
-La détection de secrets est une défense complémentaire et n’est pas infaillible.
-Les fichiers non suivis sont signalés par leur nom mais leur contenu n’est pas
-envoyé automatiquement.
+Secret detection is a supplemental defense and is not infallible. Untracked
+files are reported by name, but their contents are not sent automatically.
 
-## Prérequis
+## Prerequisites
 
-- macOS (Apple Silicon ou Intel) ;
-- Go 1.25 ou plus récent ;
-- Git ;
-- Claude Code installé et authentifié (`claude auth login`) ;
-- Codex CLI pour l’enregistrement automatique du serveur.
+- macOS on Apple Silicon or Intel;
+- Go 1.25 or newer;
+- Git;
+- Claude Code installed and authenticated (`claude auth login`);
+- Codex CLI for automatic server registration.
 
-## Compiler et tester
+## Build and Test
 
 ```bash
 go build -o ./bin/claude-reviewer ./cmd/claude-reviewer
@@ -48,13 +48,13 @@ go test ./...
 go vet ./...
 ```
 
-Ou :
+Or:
 
 ```bash
 make check
 ```
 
-## Installation utilisateur sur macOS
+## User Installation on macOS
 
 ```bash
 mkdir -p "$HOME/.local/bin"
@@ -62,74 +62,71 @@ cp ./bin/claude-reviewer "$HOME/.local/bin/claude-reviewer"
 chmod +x "$HOME/.local/bin/claude-reviewer"
 ```
 
-Ajoutez `~/.local/bin` au `PATH` si nécessaire, puis diagnostiquez
-l’environnement :
+Add `~/.local/bin` to `PATH` if necessary, then diagnose the environment:
 
 ```bash
 claude-reviewer doctor
 ```
 
-Le rapport JSON vérifie le binaire et la version de Claude Code,
-l’authentification, Git, l’écriture dans le dossier de données, le stockage des
-sessions et les flags CLI requis.
+The JSON report checks the Claude Code binary and version, authentication, Git,
+write access to the data directory, session storage, and required CLI flags.
 
-## Installation MCP dans Codex
+## MCP Installation in Codex
 
-La commande recommandée injecte le chemin absolu réel :
+The recommended command injects the actual absolute path:
 
 ```bash
 codex mcp add claude-reviewer -- "$HOME/.local/bin/claude-reviewer" serve
 codex mcp list
 ```
 
-Configuration TOML équivalente (remplacez le nom d’utilisateur) :
+Equivalent TOML configuration (replace the username):
 
 ```toml
 [mcp_servers.claude-reviewer]
-command = "/Users/UTILISATEUR/.local/bin/claude-reviewer"
+command = "/Users/USERNAME/.local/bin/claude-reviewer"
 args = ["serve"]
 ```
 
-N’écrivez pas littéralement `$HOME` dans `command` : aucune expansion shell
-n’est garantie dans ce champ.
+Do not write `$HOME` literally in `command`; shell expansion is not guaranteed
+for this field.
 
-Le serveur démarre sans sous-commande ou explicitement avec :
+The server starts with no subcommand or explicitly with:
 
 ```bash
 claude-reviewer
 claude-reviewer serve
 ```
 
-## Utilisation
+## Usage
 
-`review_diff` attend au minimum `repository_path` et `goal`. `base_ref` vaut
-`HEAD`, le modèle principal vaut `fable`, le fallback vaut `opus`, l’effort vaut
-`max` et `max_turns` vaut 12. Le résultat contient un
-nouveau `review_id` et le `claude_session_id` persisté.
+`review_diff` requires at least `repository_path` and `goal`. `base_ref`
+defaults to `HEAD`, the primary model to `fable`, the fallback model to `opus`,
+the effort to `max`, and `max_turns` to 12. The result contains a new
+`review_id` and the persisted `claude_session_id`.
 
-L’effort `max` privilégie délibérément la qualité de revue au détriment du coût
-et de la latence. Un appel peut choisir un effort inférieur parmi `low`,
-`medium`, `high` et `xhigh`.
+The `max` effort deliberately prioritizes review quality over cost and latency.
+Each call can choose a lower effort from `low`, `medium`, `high`, and `xhigh`.
 
-`continue_review` attend le même `review_id` et un nouveau `message`. Avec
-`refresh_diff: true`, le serveur recalcule le diff et l’ajoute au seul message
-de suivi. Il recharge l’association depuis le disque et invoque exactement :
+`continue_review` requires the same `review_id` and a new `message`. With
+`refresh_diff: true`, the server recomputes the diff and adds it only to the
+follow-up message. It reloads the association from disk and invokes exactly:
 
 ```text
-claude -p --resume <claude_session_id> ... <nouveau-message>
+claude -p --resume <claude_session_id> ... <new-message>
 ```
 
-Le contexte conversationnel appartient donc à la session native Claude et
-survit aux redémarrages du serveur, de Codex et du Mac.
+The conversational context therefore belongs to the native Claude session and
+survives restarts of the server, Codex, and the Mac.
 
-`get_review` ne contacte pas Claude. `list_reviews` accepte les filtres
-`repository_path` et `status`. `close_review` ferme l’association ; avec
-`delete_claude_session: true`, la V1 supprime seulement l’association locale,
-pas les données natives de Claude Code.
+`get_review` does not contact Claude. `list_reviews` accepts `repository_path`
+and `status` filters. `close_review` closes the association; with
+`delete_claude_session: true`, V1 deletes only the local association, not native
+Claude Code data.
 
-## Configuration facultative
+## Optional Configuration
 
-Créez `~/Library/Application Support/claude-reviewer/config.json` :
+Create `~/Library/Application Support/claude-reviewer/config.json`:
 
 ```json
 {
@@ -146,23 +143,23 @@ Créez `~/Library/Application Support/claude-reviewer/config.json` :
 }
 ```
 
-Sans chemin explicite, la résolution essaie le `PATH`, puis les chemins
-Homebrew Apple Silicon et Intel. `session_retention_days` est réservé au futur
-nettoyage explicite ; aucune session n’est supprimée automatiquement en V1.
+Without an explicit path, resolution tries `PATH`, then the Apple Silicon and
+Intel Homebrew paths. `session_retention_days` is reserved for future explicit
+cleanup; V1 never deletes sessions automatically.
 
-## Erreurs
+## Errors
 
-Les erreurs d’outil sont du JSON exploitable (`code`, `message`, `details`) et
-n’exposent ni stack trace, ni prompt, ni diff. Les codes incluent notamment
-`invalid_repository`, `invalid_base_ref`, `review_not_found`, `review_closed`,
-`review_busy`, `repository_mismatch`, `claude_not_found`,
-`claude_not_authenticated`, `claude_timeout`, `claude_failed`,
-`claude_session_id_missing`, `invalid_claude_output`, `diff_too_large`,
-`claude_output_too_large`, `sensitive_content_detected` et `storage_error`.
+Tool errors are actionable JSON (`code`, `message`, `details`) and expose no
+stack trace, prompt, or diff. Codes include `invalid_repository`,
+`invalid_base_ref`, `review_not_found`, `review_closed`, `review_busy`,
+`repository_mismatch`, `claude_not_found`, `claude_not_authenticated`,
+`claude_timeout`, `claude_failed`, `claude_session_id_missing`,
+`invalid_claude_output`, `diff_too_large`, `claude_output_too_large`,
+`sensitive_content_detected`, and `storage_error`.
 
-## Limites V1
+## V1 Limitations
 
-Pas de serveur HTTP, interface graphique, GitHub App, commentaire de PR,
-modification de code par Claude, base réseau, synchronisation multi-Mac,
-télémétrie ou découpage automatique des diffs supérieurs à 2 Mio. Fermer une
-revue ne supprime pas sa conversation dans le stockage natif de Claude Code.
+V1 has no HTTP server, graphical interface, GitHub App, PR comments, Claude code
+modification, network database, multi-Mac synchronization, telemetry, or
+automatic splitting of diffs larger than 2 MiB. Closing a review does not delete
+its conversation from native Claude Code storage.

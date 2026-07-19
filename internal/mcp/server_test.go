@@ -9,7 +9,7 @@ import (
 )
 
 func TestSafeErrorIsStructuredAndHidesCause(t *testing.T) {
-	err := safeError(apperr.Wrap("claude_failed", "Claude a échoué.", errors.New("secret process detail"), map[string]any{"attempt": 1}))
+	err := safeError(apperr.Wrap("claude_failed", "Claude failed.", errors.New("secret process detail"), map[string]any{"attempt": 1}))
 	text := err.Error()
 	if !strings.Contains(text, `"code":"claude_failed"`) || !strings.Contains(text, `"details":{"attempt":1}`) {
 		t.Fatalf("error=%s", text)

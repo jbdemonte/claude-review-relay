@@ -1,121 +1,121 @@
-# Cahier de cadrage — Serveur MCP Go « Claude Reviewer » pour Codex
+# Scoping Document — “Claude Reviewer” Go MCP Server for Codex
 
-## 1. Objectif
+## 1. Objective
 
-Créer sur macOS un serveur MCP local écrit en Go permettant à Codex d’utiliser Claude Code comme reviewer indépendant.
+Create a local MCP server on macOS, written in Go, that allows Codex to use Claude Code as an independent reviewer.
 
-Le workflow cible est :
+The target workflow is:
 
 ```text
-Codex implémente un changement
+Codex implements a change
         │
         ▼
-Codex appelle l’outil MCP review_diff
+Codex calls the review_diff MCP tool
         │
         ▼
-Le serveur Go lance Claude Code en lecture seule
+The Go server launches Claude Code in read-only mode
         │
         ▼
-Claude analyse le dépôt et le diff
+Claude analyzes the repository and the diff
         │
         ▼
-Claude retourne une revue structurée
+Claude returns a structured review
         │
         ▼
-Codex corrige ou répond aux remarques
+Codex fixes or responds to the remarks
         │
         ▼
-Codex appelle continue_review avec le même review_id
+Codex calls continue_review with the same review_id
         │
         ▼
-Le serveur Go reprend exactement la même session Claude
+The Go server resumes exactly the same Claude session
 ```
 
-Le point essentiel est la conservation du contexte Claude entre plusieurs appels. Une revue commencée doit pouvoir être reprise avec ses analyses, les fichiers déjà lus, les remarques précédentes et les réponses de Codex.
+The essential point is preserving Claude's context across multiple calls. A review that has been started must be resumable with its analyses, the files already read, the previous remarks, and Codex's responses.
 
 ---
 
-## 2. Contraintes générales
+## 2. General constraints
 
-- Langage : Go.
-- Plateforme cible initiale : macOS Apple Silicon et Intel.
-- Transport MCP : STDIO.
-- Le programme doit fonctionner comme un binaire unique.
-- Claude Code est appelé via son CLI local.
-- Aucune clé Anthropic ne doit être enregistrée par le programme.
-- L’authentification existante de `claude` doit être réutilisée.
-- Claude agit uniquement comme reviewer.
-- Claude doit pouvoir lire le dépôt, mais ne doit jamais modifier les fichiers.
-- Le serveur ne doit jamais exécuter de commande Git destructive.
-- Le protocole STDIO doit rester propre :
-  - stdout exclusivement réservé aux messages MCP ;
-  - logs et diagnostics exclusivement sur stderr.
-- Le projet doit être installable et configurable par Codex directement sur le Mac.
+- Language: Go.
+- Initial target platform: macOS Apple Silicon and Intel.
+- MCP transport: STDIO.
+- The program must run as a single binary.
+- Claude Code is invoked via its local CLI.
+- The program must never store any Anthropic key.
+- The existing `claude` authentication must be reused.
+- Claude acts solely as a reviewer.
+- Claude must be able to read the repository but must never modify files.
+- The server must never run destructive Git commands.
+- The STDIO protocol must remain clean:
+  - stdout reserved exclusively for MCP messages;
+  - logs and diagnostics exclusively on stderr.
+- The project must be installable and configurable by Codex directly on the Mac.
 
 ---
 
-## 3. Principe de persistance du contexte
+## 3. Context persistence principle
 
-Claude Code prend en charge les sessions persistantes. Le serveur doit conserver le `session_id` Claude associé à chaque revue.
+Claude Code supports persistent sessions. The server must keep the Claude `session_id` associated with each review.
 
-### Premier appel
+### First call
 
-Lors d’un premier appel à `review_diff` :
+On a first call to `review_diff`:
 
-1. générer un `review_id` ;
-2. générer ou laisser Claude générer un `session_id` ;
-3. lancer Claude Code en mode non interactif ;
-4. récupérer le `session_id` dans la sortie structurée ;
-5. enregistrer l’association :
-   - `review_id` ;
-   - `claude_session_id` ;
-   - chemin canonique du dépôt ;
-   - date de création ;
-   - date de dernière utilisation ;
-   - objectif de la revue ;
-   - base Git utilisée ;
-   - état de la revue.
+1. generate a `review_id`;
+2. generate a `session_id`, or let Claude generate one;
+3. launch Claude Code in non-interactive mode;
+4. retrieve the `session_id` from the structured output;
+5. record the association:
+   - `review_id`;
+   - `claude_session_id`;
+   - canonical repository path;
+   - creation date;
+   - last-used date;
+   - review goal;
+   - Git base used;
+   - review status.
 
-### Appels suivants
+### Subsequent calls
 
-Lors d’un appel à `continue_review` :
+On a call to `continue_review`:
 
-1. retrouver l’enregistrement grâce au `review_id` ;
-2. vérifier que le dépôt demandé correspond au dépôt de la session ;
-3. relancer Claude avec :
+1. look up the record using the `review_id`;
+2. verify that the requested repository matches the session's repository;
+3. relaunch Claude with:
 
 ```bash
 claude -p --resume "<claude_session_id>" ...
 ```
 
-4. envoyer uniquement le nouveau message à Claude ;
-5. ne pas reconstruire artificiellement tout l’historique dans le prompt ;
-6. mettre à jour la date de dernière utilisation.
+4. send only the new message to Claude;
+5. do not artificially rebuild the entire history in the prompt;
+6. update the last-used date.
 
-### Persistance sur disque
+### On-disk persistence
 
-La persistance doit survivre :
+Persistence must survive:
 
-- à plusieurs appels MCP ;
-- à un redémarrage du serveur MCP ;
-- à un redémarrage de Codex ;
-- idéalement à un redémarrage du Mac.
+- multiple MCP calls;
+- a restart of the MCP server;
+- a restart of Codex;
+- ideally, a restart of the Mac.
 
-Stockage recommandé pour la V1 :
+Recommended storage for V1:
 
 ```text
 ~/Library/Application Support/claude-reviewer/sessions.json
 ```
 
-Un stockage JSON atomique suffit pour la V1.
+Atomic JSON storage is sufficient for V1.
 
-Écriture atomique obligatoire :
+Atomic writes are mandatory:
 
-1. écrire dans un fichier temporaire du même dossier ;
-2. appeler `Sync()` ;
-3. renommer le fichier temporaire vers `sessions.json`.
+1. write to a temporary file in the same directory;
+2. call `Sync()`;
+3. rename the temporary file to `sessions.json`.
 
-Prévoir une interface Go de stockage afin de pouvoir remplacer ultérieurement JSON par SQLite sans modifier le reste du code.
+Provide a Go storage interface so that JSON can later be replaced with SQLite without modifying the rest of the code.
 
 ```go
 type SessionStore interface {
@@ -127,22 +127,22 @@ type SessionStore interface {
 }
 ```
 
-Ne jamais utiliser simplement `claude --continue`, car cette option reprend la dernière session du répertoire et peut donc reprendre la mauvaise conversation. Toujours utiliser un identifiant explicite avec `--resume`.
+Never simply use `claude --continue`, because that option resumes the most recent session in the directory and can therefore resume the wrong conversation. Always use an explicit identifier with `--resume`.
 
 ---
 
-## 4. Outils MCP à exposer
+## 4. MCP tools to expose
 
 ### 4.1 `review_diff`
 
-Démarre une nouvelle revue et crée une nouvelle session Claude.
+Starts a new review and creates a new Claude session.
 
-Entrée :
+Input:
 
 ```json
 {
-  "repository_path": "/chemin/absolu/du/repo",
-  "goal": "Description du changement réalisé",
+  "repository_path": "/absolute/path/to/repo",
+  "goal": "Description of the change that was made",
   "base_ref": "HEAD",
   "review_focus": [
     "correctness",
@@ -152,65 +152,65 @@ Entrée :
     "security",
     "tests"
   ],
-  "additional_context": "Contexte facultatif",
-  "test_results": "Résultats facultatifs des tests déjà exécutés",
+  "additional_context": "Optional context",
+  "test_results": "Optional results of tests already run",
   "model": "opus",
   "max_turns": 12
 }
 ```
 
-Règles :
+Rules:
 
-- `repository_path` est obligatoire.
-- Le chemin doit exister.
-- Le chemin doit être un dépôt Git.
-- Convertir le chemin en chemin absolu canonique.
-- `goal` est obligatoire.
-- `base_ref` vaut `HEAD` par défaut.
-- Le diff doit être calculé par le serveur, pas fourni aveuglément par Codex.
-- Le serveur peut utiliser :
-  - `git diff <base_ref>` pour les modifications non commitées ;
-  - les fichiers non suivis doivent être signalés séparément ;
-  - ne jamais envoyer automatiquement de fichiers manifestement secrets.
-- La réponse doit contenir le nouveau `review_id`.
+- `repository_path` is required.
+- The path must exist.
+- The path must be a Git repository.
+- Convert the path to a canonical absolute path.
+- `goal` is required.
+- `base_ref` defaults to `HEAD`.
+- The diff must be computed by the server, not blindly supplied by Codex.
+- The server may use:
+  - `git diff <base_ref>` for uncommitted changes;
+  - untracked files must be reported separately;
+  - never automatically send obviously secret files.
+- The response must contain the new `review_id`.
 
 ### 4.2 `continue_review`
 
-Reprend la même conversation Claude.
+Resumes the same Claude conversation.
 
-Entrée :
+Input:
 
 ```json
 {
-  "review_id": "uuid-de-la-revue",
-  "message": "J’ai corrigé les points F001 et F003. Vérifie le nouveau diff.",
+  "review_id": "review-uuid",
+  "message": "I have fixed findings F001 and F003. Check the new diff.",
   "refresh_diff": true,
-  "test_results": "Nouveaux résultats facultatifs"
+  "test_results": "Optional new results"
 }
 ```
 
-Règles :
+Rules:
 
-- reprendre la session avec son `claude_session_id` ;
-- utiliser le même répertoire de travail ;
-- si `refresh_diff` vaut `true`, recalculer le diff courant et l’ajouter au nouveau message ;
-- rappeler à Claude qu’il s’agit de la suite de la revue, sans répéter tout le prompt initial ;
-- retourner une nouvelle réponse structurée ;
-- conserver le même `review_id`.
+- resume the session using its `claude_session_id`;
+- use the same working directory;
+- if `refresh_diff` is `true`, recompute the current diff and add it to the new message;
+- remind Claude that this is the continuation of the review, without repeating the entire initial prompt;
+- return a new structured response;
+- keep the same `review_id`.
 
 ### 4.3 `get_review`
 
-Retourne les métadonnées locales d’une revue sans appeler Claude.
+Returns the local metadata of a review without calling Claude.
 
-Entrée :
+Input:
 
 ```json
 {
-  "review_id": "uuid-de-la-revue"
+  "review_id": "review-uuid"
 }
 ```
 
-Sortie :
+Output:
 
 ```json
 {
@@ -224,45 +224,45 @@ Sortie :
 }
 ```
 
-Ne pas retourner de secret ni le contenu intégral de la conversation.
+Do not return any secrets or the full content of the conversation.
 
 ### 4.4 `list_reviews`
 
-Liste les revues persistées, triées de la plus récente à la plus ancienne.
+Lists persisted reviews, sorted from most recent to oldest.
 
-Entrée facultative :
+Optional input:
 
 ```json
 {
-  "repository_path": "/chemin/facultatif",
+  "repository_path": "/optional/path",
   "status": "open"
 }
 ```
 
 ### 4.5 `close_review`
 
-Marque une revue comme fermée.
+Marks a review as closed.
 
-Entrée :
+Input:
 
 ```json
 {
-  "review_id": "uuid-de-la-revue",
+  "review_id": "review-uuid",
   "delete_claude_session": false
 }
 ```
 
-Pour la V1, il n’est pas nécessaire de supprimer les données natives de Claude Code. Il suffit de fermer ou supprimer l’association locale selon l’option choisie.
+For V1, there is no need to delete Claude Code's native data. It is enough to close or delete the local association, depending on the chosen option.
 
 ---
 
-## 5. Exécution de Claude Code
+## 5. Running Claude Code
 
-### Commande initiale recommandée
+### Recommended initial command
 
-Utiliser une sortie en flux JSON afin de récupérer de manière robuste le message d’initialisation et le `session_id`.
+Use JSON stream output to robustly retrieve the initialization message and the `session_id`.
 
-Forme générale :
+General form:
 
 ```bash
 claude \
@@ -277,13 +277,13 @@ claude \
   "<prompt>"
 ```
 
-Le processus doit être lancé avec :
+The process must be launched with:
 
 ```go
 cmd.Dir = repositoryPath
 ```
 
-### Reprise de session
+### Session resumption
 
 ```bash
 claude \
@@ -295,52 +295,52 @@ claude \
   --tools "Read,Glob,Grep" \
   --disallowedTools "Edit" "Write" "NotebookEdit" "Bash" "WebSearch" "WebFetch" "mcp__*" \
   --max-turns 12 \
-  "<message-de-suivi>"
+  "<follow-up-message>"
 ```
 
-### Sécurité lecture seule
+### Read-only security
 
-Claude ne doit disposer que de :
+Claude must have access only to:
 
-- `Read` ;
-- `Glob` ;
+- `Read`;
+- `Glob`;
 - `Grep`.
 
-Tout outil d’écriture ou d’exécution doit être interdit.
+Any write or execution tool must be forbidden.
 
-Le serveur Go calcule lui-même le diff Git avant de lancer Claude. Cela évite de donner à Claude l’outil Bash.
+The Go server computes the Git diff itself before launching Claude. This avoids giving Claude the Bash tool.
 
-Interdire au minimum :
+Forbid at minimum:
 
-- `Edit` ;
-- `Write` ;
-- `NotebookEdit` ;
-- `Bash` ;
-- `WebSearch` ;
-- `WebFetch` ;
-- tous les outils MCP externes.
+- `Edit`;
+- `Write`;
+- `NotebookEdit`;
+- `Bash`;
+- `WebSearch`;
+- `WebFetch`;
+- all external MCP tools.
 
-Ne pas utiliser `--dangerously-skip-permissions`.
+Do not use `--dangerously-skip-permissions`.
 
-### Timeout et interruption
+### Timeout and interruption
 
-- Timeout par défaut d’un appel Claude : 10 minutes.
-- Timeout configurable dans le fichier de configuration.
-- Utiliser `exec.CommandContext`.
-- En cas d’annulation MCP, interrompre le processus enfant.
-- Sur macOS, s’assurer que les processus descendants ne restent pas orphelins.
-- Capturer stderr séparément pour les diagnostics.
-- Limiter la taille des sorties conservées en mémoire.
+- Default timeout for a Claude call: 10 minutes.
+- Timeout configurable in the configuration file.
+- Use `exec.CommandContext`.
+- On MCP cancellation, interrupt the child process.
+- On macOS, ensure that descendant processes are not left orphaned.
+- Capture stderr separately for diagnostics.
+- Limit the size of outputs kept in memory.
 
 ---
 
-## 6. Récupération du `session_id`
+## 6. Retrieving the `session_id`
 
-Le parseur de `stream-json` doit lire stdout ligne par ligne.
+The `stream-json` parser must read stdout line by line.
 
-Lorsqu’un événement système d’initialisation est reçu, extraire le `session_id`.
+When a system initialization event is received, extract the `session_id`.
 
-Le code ne doit pas dépendre de l’ordre exact de tous les événements, uniquement de champs structurants tels que :
+The code must not depend on the exact order of all events, only on structural fields such as:
 
 ```json
 {
@@ -350,23 +350,23 @@ Le code ne doit pas dépendre de l’ordre exact de tous les événements, uniqu
 }
 ```
 
-La forme exacte pouvant évoluer, le parseur doit :
+Since the exact format may evolve, the parser must:
 
-- ignorer les champs inconnus ;
-- accepter que le `session_id` soit présent directement ou dans une structure enveloppante ;
-- conserver les lignes non reconnues dans les logs de debug ;
-- échouer clairement si aucun `session_id` n’est obtenu lors d’une nouvelle revue ;
-- accepter qu’une reprise conserve le même identifiant.
+- ignore unknown fields;
+- accept that the `session_id` may appear directly or inside a wrapper structure;
+- keep unrecognized lines in the debug logs;
+- fail clearly if no `session_id` is obtained during a new review;
+- accept that a resumption keeps the same identifier.
 
-Ajouter des tests unitaires avec plusieurs exemples de flux JSON.
+Add unit tests with several examples of JSON streams.
 
 ---
 
-## 7. Format de réponse demandé à Claude
+## 7. Response format requested from Claude
 
-Utiliser `--json-schema` lorsque la version locale de Claude Code le prend en charge.
+Use `--json-schema` when the local version of Claude Code supports it.
 
-Schéma logique :
+Logical schema:
 
 ```json
 {
@@ -454,7 +454,7 @@ Schéma logique :
 }
 ```
 
-Chaque finding doit avoir un identifiant stable dans la conversation :
+Each finding must have a stable identifier within the conversation:
 
 ```text
 F001
@@ -462,14 +462,14 @@ F002
 F003
 ```
 
-Lors d’une reprise, Claude doit explicitement indiquer pour les anciens findings :
+On resumption, Claude must explicitly indicate, for previous findings:
 
-- `resolved` ;
-- `still_open` ;
-- `invalidated` ;
-- ou `partially_resolved`.
+- `resolved`;
+- `still_open`;
+- `invalidated`;
+- or `partially_resolved`.
 
-Le schéma peut donc être étendu pour `continue_review` avec :
+The schema can therefore be extended for `continue_review` with:
 
 ```json
 {
@@ -485,58 +485,62 @@ Le schéma peut donc être étendu pour `continue_review` avec :
 
 ---
 
-## 8. Prompt système du reviewer
+## 8. Reviewer system prompt
 
-Créer un fichier embarqué, par exemple :
+Create an embedded file, for example:
 
 ```text
 internal/reviewer/prompts/reviewer.md
 ```
 
-Contenu attendu :
+Expected content:
 
 ```text
-Tu es un reviewer logiciel senior indépendant.
+You are an independent senior software reviewer.
 
-Tu n’es pas l’auteur du changement. Ton rôle est de rechercher activement les
-défauts réels, les régressions, les hypothèses fragiles et les tests manquants.
+You are not the author of the change. Your role is to actively look for real
+defects, regressions, fragile assumptions, and missing tests.
 
-Tu travailles en lecture seule. Tu ne dois jamais modifier de fichier.
+You work in read-only mode. You must never modify a file.
 
-Règles :
-- Examine le diff, puis lis les fichiers environnants nécessaires.
-- Vérifie les appels entrants et sortants des fonctions modifiées.
-- Ne signale pas de préférences stylistiques sans impact concret.
-- Chaque finding doit décrire un scénario reproductible ou un risque précis.
-- Cite le fichier et, lorsque possible, la ligne.
-- Ne prétends pas avoir exécuté des tests.
-- Distingue faits, hypothèses et incertitudes.
-- Ne recommande pas une refonte générale lorsqu’une correction locale suffit.
-- Tiens compte de l’objectif fonctionnel fourni.
-- Pour une reprise de revue, conserve les identifiants des anciens findings.
-- Vérifie les corrections avant de marquer un finding comme résolu.
-- Une approbation signifie qu’aucun problème significatif n’a été identifié,
-  pas que le code est garanti sans défaut.
+Rules:
+
+- Examine the diff, then read the necessary surrounding files.
+- Check callers and callees of modified functions.
+- Do not report stylistic preferences without a concrete impact.
+- Each finding must describe a reproducible scenario or a specific risk.
+- Cite the file and, when possible, the line.
+- Do not claim to have run tests.
+- Distinguish facts, assumptions, and uncertainties.
+- Do not recommend a broad redesign when a local fix is sufficient.
+- Consider the provided functional goal.
+- When resuming a review, preserve previous finding IDs.
+- Verify fixes before marking a finding as resolved.
+- Approval means that no significant issue was identified, not that the code is
+  guaranteed to be defect-free.
+
+Use stable finding IDs F001, F002, F003, and so on. For each resumed review,
+report the status of every previous finding in `previous_findings`.
 ```
 
-Le premier prompt utilisateur doit inclure :
+The first user prompt must include:
 
-- l’objectif ;
-- la base Git ;
-- le diff ;
-- les fichiers non suivis ;
-- les résultats des tests fournis ;
-- le contexte additionnel ;
-- les axes de revue demandés ;
-- l’instruction de lire le code environnant en lecture seule.
+- the goal;
+- the Git base;
+- the diff;
+- the untracked files;
+- the provided test results;
+- the additional context;
+- the requested review focus areas;
+- the instruction to read the surrounding code in read-only mode.
 
 ---
 
-## 9. Gestion du diff
+## 9. Diff handling
 
-Créer un composant Git dédié.
+Create a dedicated Git component.
 
-Interface suggérée :
+Suggested interface:
 
 ```go
 type GitService interface {
@@ -549,7 +553,7 @@ type GitService interface {
 }
 ```
 
-Commandes autorisées dans le processus Go :
+Commands allowed in the Go process:
 
 ```bash
 git rev-parse --show-toplevel
@@ -560,54 +564,54 @@ git diff --no-ext-diff --unified=80 <base_ref> --
 git status --porcelain=v1
 ```
 
-Utiliser `exec.CommandContext` avec des arguments séparés. Ne jamais construire une commande shell concaténée.
+Use `exec.CommandContext` with separate arguments. Never build a concatenated shell command.
 
-### Limite de taille
+### Size limit
 
-Le diff peut être énorme.
+The diff can be huge.
 
-Prévoir :
+Provide:
 
-- limite configurable, par défaut 2 Mio ;
-- détection des fichiers binaires ;
-- message d’erreur explicite si le diff dépasse la limite ;
-- possibilité future de découper la revue par fichiers ;
-- ne jamais tronquer silencieusement.
+- a configurable limit, 2 MiB by default;
+- binary file detection;
+- an explicit error message if the diff exceeds the limit;
+- a future option to split the review by files;
+- never truncate silently.
 
-Pour la V1, si la limite est dépassée, retourner une erreur expliquant à Codex qu’il doit réduire la portée du changement ou choisir une future option de filtrage.
+For V1, if the limit is exceeded, return an error explaining to Codex that it must reduce the scope of the change or choose a future filtering option.
 
 ---
 
-## 10. Protection contre les secrets
+## 10. Protection against secrets
 
-Avant d’envoyer le diff à Claude, détecter au minimum :
+Before sending the diff to Claude, detect at minimum:
 
-- fichiers `.env` ;
-- clés privées ;
-- noms de fichiers contenant `secret`, `credentials`, `token` ;
-- blocs ressemblant à des clés PEM ;
-- chaînes manifestement assimilables à des tokens.
+- `.env` files;
+- private keys;
+- file names containing `secret`, `credentials`, `token`;
+- blocks resembling PEM keys;
+- strings that are clearly token-like.
 
-Comportement :
+Behavior:
 
-- ne pas enregistrer les secrets dans les logs ;
-- remplacer leur valeur par `[REDACTED]` lorsque cela est raisonnable ;
-- refuser la revue si une clé privée complète est détectée ;
-- indiquer à Codex quels fichiers ont été exclus ou masqués.
+- do not record secrets in the logs;
+- replace their value with `[REDACTED]` when reasonable;
+- refuse the review if a complete private key is detected;
+- tell Codex which files were excluded or masked.
 
-Ne pas prétendre que cette détection est infaillible.
+Do not claim that this detection is foolproof.
 
 ---
 
 ## 11. Configuration
 
-Créer un fichier facultatif :
+Create an optional file:
 
 ```text
 ~/Library/Application Support/claude-reviewer/config.json
 ```
 
-Exemple :
+Example:
 
 ```json
 {
@@ -621,39 +625,39 @@ Exemple :
 }
 ```
 
-Résolution du binaire Claude :
+Claude binary resolution:
 
-1. configuration explicite ;
-2. `exec.LookPath("claude")` ;
-3. chemins Homebrew courants :
-   - `/opt/homebrew/bin/claude` ;
+1. explicit configuration;
+2. `exec.LookPath("claude")`;
+3. common Homebrew paths:
+   - `/opt/homebrew/bin/claude`;
    - `/usr/local/bin/claude`.
 
-Ne jamais coder uniquement un chemin Apple Silicon.
+Never hardcode only an Apple Silicon path.
 
-Ajouter une commande :
+Add a command:
 
 ```bash
 claude-reviewer doctor
 ```
 
-Elle doit vérifier :
+It must check:
 
-- présence du binaire Claude ;
-- version de Claude Code ;
-- authentification avec `claude auth status` ;
-- présence de Git ;
-- accès en écriture au dossier de données ;
-- validité du stockage des sessions ;
-- compatibilité des flags CLI nécessaires.
+- presence of the Claude binary;
+- Claude Code version;
+- authentication with `claude auth status`;
+- presence of Git;
+- write access to the data directory;
+- validity of the session storage;
+- compatibility of the required CLI flags.
 
-Le mode MCP reste la commande par défaut :
+MCP mode remains the default command:
 
 ```bash
 claude-reviewer
 ```
 
-ou explicitement :
+or explicitly:
 
 ```bash
 claude-reviewer serve
@@ -661,7 +665,7 @@ claude-reviewer serve
 
 ---
 
-## 12. Structure de projet souhaitée
+## 12. Desired project structure
 
 ```text
 claude-reviewer/
@@ -704,11 +708,11 @@ claude-reviewer/
 └── LICENSE
 ```
 
-Choisir une bibliothèque MCP Go maintenue et raisonnablement légère. Avant de l’ajouter, vérifier sa documentation actuelle et privilégier un SDK officiel ou clairement maintenu. Isoler la bibliothèque derrière le package `internal/mcp` pour limiter le couplage.
+Choose a maintained and reasonably lightweight Go MCP library. Before adding it, check its current documentation and prefer an official or clearly maintained SDK. Isolate the library behind the `internal/mcp` package to limit coupling.
 
 ---
 
-## 13. Modèle de données
+## 13. Data model
 
 ```go
 type ReviewSession struct {
@@ -732,31 +736,31 @@ const (
 )
 ```
 
-Les chemins doivent être normalisés avec résolution des liens symboliques lorsque possible.
+Paths must be normalized, resolving symbolic links when possible.
 
-Le serveur doit empêcher l’utilisation d’un `review_id` dans un autre dépôt.
-
----
-
-## 14. Concurrence
-
-Plusieurs appels MCP peuvent arriver simultanément.
-
-Règles :
-
-- autoriser des revues différentes en parallèle ;
-- interdire deux appels simultanés sur le même `review_id` ;
-- utiliser un verrou par session ;
-- protéger le stockage JSON ;
-- écrire les données atomiquement ;
-- retourner une erreur claire `review_busy` si une session est déjà utilisée ;
-- ne pas bloquer toutes les revues à cause d’une seule session longue.
+The server must prevent a `review_id` from being used in a different repository.
 
 ---
 
-## 15. Erreurs MCP structurées
+## 14. Concurrency
 
-Définir des erreurs exploitables :
+Multiple MCP calls may arrive simultaneously.
+
+Rules:
+
+- allow different reviews in parallel;
+- forbid two simultaneous calls on the same `review_id`;
+- use a per-session lock;
+- protect the JSON storage;
+- write data atomically;
+- return a clear `review_busy` error if a session is already in use;
+- do not block all reviews because of a single long-running session.
+
+---
+
+## 15. Structured MCP errors
+
+Define actionable errors:
 
 - `invalid_repository`
 - `invalid_base_ref`
@@ -774,59 +778,59 @@ Définir des erreurs exploitables :
 - `sensitive_content_detected`
 - `storage_error`
 
-Chaque erreur doit comporter :
+Each error must include:
 
 ```json
 {
   "code": "review_not_found",
-  "message": "Aucune revue ne correspond à cet identifiant.",
+  "message": "No review matches this identifier.",
   "details": {}
 }
 ```
 
-Ne jamais retourner une stack trace brute à Codex.
+Never return a raw stack trace to Codex.
 
 ---
 
 ## 16. Logs
 
-Logs JSON ou `slog`.
+JSON logs or `slog`.
 
-Inclure :
+Include:
 
-- timestamp ;
-- niveau ;
-- outil MCP ;
-- `review_id` ;
-- durée ;
-- code de sortie Claude ;
-- taille du diff ;
-- nombre de findings.
+- timestamp;
+- level;
+- MCP tool;
+- `review_id`;
+- duration;
+- Claude exit code;
+- diff size;
+- number of findings.
 
-Ne pas logger :
+Do not log:
 
-- diff complet ;
-- prompts complets ;
-- secrets ;
-- réponse Claude complète par défaut.
+- the full diff;
+- full prompts;
+- secrets;
+- the full Claude response by default.
 
-Prévoir un mode debug explicite.
+Provide an explicit debug mode.
 
-Tous les logs doivent aller sur stderr.
+All logs must go to stderr.
 
 ---
 
-## 17. Installation macOS
+## 17. macOS installation
 
-Le README doit fournir les commandes suivantes.
+The README must provide the following commands.
 
-### Compilation
+### Build
 
 ```bash
 go build -o ./bin/claude-reviewer ./cmd/claude-reviewer
 ```
 
-### Installation utilisateur
+### User installation
 
 ```bash
 mkdir -p "$HOME/.local/bin"
@@ -834,199 +838,199 @@ cp ./bin/claude-reviewer "$HOME/.local/bin/claude-reviewer"
 chmod +x "$HOME/.local/bin/claude-reviewer"
 ```
 
-Vérifier que `~/.local/bin` est dans le `PATH`.
+Verify that `~/.local/bin` is in the `PATH`.
 
-### Diagnostic
+### Diagnostics
 
 ```bash
 claude-reviewer doctor
 ```
 
-### Ajout dans Codex
+### Adding to Codex
 
-Commande préférée :
+Preferred command:
 
 ```bash
 codex mcp add claude-reviewer -- "$HOME/.local/bin/claude-reviewer" serve
 ```
 
-Puis :
+Then:
 
 ```bash
 codex mcp list
 ```
 
-Configuration TOML équivalente :
+Equivalent TOML configuration:
 
 ```toml
 [mcp_servers.claude-reviewer]
-command = "/Users/UTILISATEUR/.local/bin/claude-reviewer"
+command = "/Users/USERNAME/.local/bin/claude-reviewer"
 args = ["serve"]
 ```
 
-Ne pas écrire littéralement `$HOME` dans le champ `command` TOML, car l’expansion shell n’est pas garantie. Le script d’installation doit injecter le chemin absolu réel.
+Do not write `$HOME` literally in the TOML `command` field, because shell expansion is not guaranteed. The installation script must inject the real absolute path.
 
 ---
 
-## 18. Instructions Codex à installer dans `AGENTS.md`
+## 18. Codex instructions to install in `AGENTS.md`
 
-Le projet doit fournir ce bloc prêt à copier :
+The project must provide this ready-to-copy block:
 
 ```md
-## Revue croisée avec Claude
+## Cross-Review with Claude
 
-Pour tout changement non trivial :
+For every non-trivial change:
 
-1. Implémente le changement.
-2. Exécute les tests, le lint et le type-checking pertinents.
-3. Appelle `claude-reviewer.review_diff`.
-4. Fournis un objectif précis et les résultats de tests.
-5. Analyse chaque finding au lieu de l’accepter aveuglément.
-6. Corrige les findings confirmés de sévérité critical, high ou medium.
-7. Pour les remarques incorrectes, prépare une réponse technique factuelle.
-8. Appelle `claude-reviewer.continue_review` avec le même `review_id`.
-9. Demande à Claude de vérifier les corrections et de réévaluer les anciens findings.
-10. Arrête après deux cycles complets sauf problème critique restant.
-11. Ne considère pas une approbation Claude comme un remplacement des tests.
-12. Claude est reviewer en lecture seule ; Codex reste le seul agent qui modifie le dépôt.
+1. Implement the change.
+2. Run the relevant tests, linting, and type checking.
+3. Call `claude-reviewer.review_diff`.
+4. Provide a precise goal and the test results.
+5. Analyze each finding instead of accepting it blindly.
+6. Fix confirmed critical-, high-, and medium-severity findings.
+7. Prepare a factual technical response for incorrect findings.
+8. Call `claude-reviewer.continue_review` with the same `review_id`.
+9. Ask Claude to verify the fixes and reassess previous findings.
+10. Stop after two complete cycles unless a critical issue remains.
+11. Do not treat Claude approval as a substitute for tests.
+12. Claude is a read-only reviewer; Codex remains the only agent that modifies the repository.
 ```
 
 ---
 
-## 19. Tests obligatoires
+## 19. Mandatory tests
 
-### Tests unitaires
+### Unit tests
 
-- parsing du flux JSON Claude ;
-- extraction du `session_id` ;
-- réponse structurée ;
-- stockage et reprise d’une session ;
-- écriture atomique ;
-- verrouillage par `review_id` ;
-- détection d’un dépôt différent ;
-- validation de `base_ref` ;
-- redaction de secrets ;
-- limite de taille du diff ;
-- erreurs de timeout ;
-- erreurs de processus Claude.
+- parsing of the Claude JSON stream;
+- `session_id` extraction;
+- structured response;
+- storing and resuming a session;
+- atomic writes;
+- locking by `review_id`;
+- detection of a different repository;
+- `base_ref` validation;
+- secret redaction;
+- diff size limit;
+- timeout errors;
+- Claude process errors.
 
-### Tests d’intégration
+### Integration tests
 
-Utiliser un faux exécutable `claude` configurable dans les tests.
+Use a fake `claude` executable configurable in the tests.
 
-Scénario minimum :
+Minimum scenario:
 
-1. `review_diff` lance le faux Claude ;
-2. le faux Claude retourne un événement init avec `session_id = A` ;
-3. le serveur persiste `A` ;
-4. le serveur retourne un `review_id = R` ;
-5. `continue_review(R)` relance le faux Claude avec `--resume A` ;
-6. vérifier que le nouveau prompt ne contient que le suivi nécessaire ;
-7. redémarrer une nouvelle instance du store ;
-8. vérifier que `continue_review(R)` fonctionne toujours.
+1. `review_diff` launches the fake Claude;
+2. the fake Claude returns an init event with `session_id = A`;
+3. the server persists `A`;
+4. the server returns a `review_id = R`;
+5. `continue_review(R)` relaunches the fake Claude with `--resume A`;
+6. verify that the new prompt contains only the necessary follow-up;
+7. restart a new instance of the store;
+8. verify that `continue_review(R)` still works.
 
-### Test manuel réel
+### Real manual test
 
-Sur un petit dépôt Git :
+On a small Git repository:
 
-1. créer une modification volontairement incorrecte ;
-2. appeler `review_diff` depuis Codex ;
-3. noter le `review_id` ;
-4. corriger partiellement ;
-5. appeler `continue_review` ;
-6. vérifier que Claude se souvient du finding initial ;
-7. arrêter puis relancer Codex ;
-8. appeler encore `continue_review` avec le même identifiant ;
-9. vérifier que le contexte est conservé.
-
----
-
-## 20. Critères d’acceptation
-
-Le projet est terminé lorsque :
-
-- le binaire démarre comme serveur MCP STDIO ;
-- Codex voit les cinq outils ;
-- une revue initiale produit un `review_id` ;
-- le `claude_session_id` est persisté ;
-- un suivi reprend la même session avec `--resume` ;
-- le contexte survit au redémarrage du serveur ;
-- Claude ne peut ni écrire ni exécuter Bash ;
-- le diff est calculé par le serveur ;
-- les réponses sont structurées et validées ;
-- les erreurs sont propres et exploitables ;
-- stdout ne contient jamais de logs ;
-- `go test ./...` passe ;
-- `go vet ./...` passe ;
-- le README permet une installation complète sur macOS ;
-- `claude-reviewer doctor` valide l’environnement local ;
-- Codex peut installer le serveur avec une commande documentée.
+1. create a deliberately incorrect change;
+2. call `review_diff` from Codex;
+3. note the `review_id`;
+4. fix it partially;
+5. call `continue_review`;
+6. verify that Claude remembers the initial finding;
+7. stop and restart Codex;
+8. call `continue_review` again with the same identifier;
+9. verify that the context is preserved.
 
 ---
 
-## 21. Hors périmètre V1
+## 20. Acceptance criteria
 
-Ne pas implémenter dans la première version :
+The project is complete when:
 
-- serveur MCP HTTP distant ;
-- interface graphique ;
-- GitHub App ;
-- création automatique de commentaires de PR ;
-- modification de code par Claude ;
-- orchestration de plusieurs modèles Claude ;
-- base de données réseau ;
-- synchronisation entre plusieurs Macs ;
-- gestion centralisée d’équipe ;
-- envoi automatique de télémétrie ;
-- revue de diff de plus de 2 Mio par découpage automatique.
-
-Préparer les interfaces pour permettre ces évolutions, mais ne pas sur-concevoir la V1.
+- the binary starts as a STDIO MCP server;
+- Codex sees the five tools;
+- an initial review produces a `review_id`;
+- the `claude_session_id` is persisted;
+- a follow-up resumes the same session with `--resume`;
+- the context survives a server restart;
+- Claude can neither write nor run Bash;
+- the diff is computed by the server;
+- responses are structured and validated;
+- errors are clean and actionable;
+- stdout never contains logs;
+- `go test ./...` passes;
+- `go vet ./...` passes;
+- the README enables a complete installation on macOS;
+- `claude-reviewer doctor` validates the local environment;
+- Codex can install the server with a documented command.
 
 ---
 
-## 22. Ordre d’implémentation demandé à Codex
+## 21. Out of scope for V1
 
-1. Initialiser le module Go.
-2. Choisir et intégrer la bibliothèque MCP Go.
-3. Créer le serveur STDIO et un outil temporaire `ping`.
-4. Implémenter les chemins macOS et la configuration.
-5. Implémenter `SessionStore` JSON avec tests.
-6. Implémenter le service Git avec tests.
-7. Implémenter le client Claude et le parseur `stream-json`.
-8. Implémenter le prompt et le schéma de réponse.
-9. Implémenter `review_diff`.
-10. Implémenter `continue_review`.
-11. Implémenter `get_review`, `list_reviews`, `close_review`.
-12. Ajouter les protections de sécurité et les limites.
-13. Ajouter les verrous par session.
-14. Ajouter `doctor`.
-15. Écrire les tests d’intégration avec faux Claude.
-16. Écrire le README et le bloc `AGENTS.md`.
-17. Compiler et effectuer un test réel avec Claude Code local.
-18. Ajouter une commande d’installation Codex.
-19. Exécuter :
-    - `gofmt` ;
-    - `go test ./...` ;
+Do not implement in the first version:
+
+- remote HTTP MCP server;
+- graphical interface;
+- GitHub App;
+- automatic creation of PR comments;
+- code modification by Claude;
+- orchestration of multiple Claude models;
+- networked database;
+- synchronization across multiple Macs;
+- centralized team management;
+- automatic telemetry submission;
+- review of diffs larger than 2 MiB via automatic splitting.
+
+Prepare the interfaces to allow these evolutions, but do not over-engineer V1.
+
+---
+
+## 22. Implementation order requested of Codex
+
+1. Initialize the Go module.
+2. Choose and integrate the Go MCP library.
+3. Create the STDIO server and a temporary `ping` tool.
+4. Implement the macOS paths and the configuration.
+5. Implement the JSON `SessionStore` with tests.
+6. Implement the Git service with tests.
+7. Implement the Claude client and the `stream-json` parser.
+8. Implement the prompt and the response schema.
+9. Implement `review_diff`.
+10. Implement `continue_review`.
+11. Implement `get_review`, `list_reviews`, `close_review`.
+12. Add the security protections and limits.
+13. Add the per-session locks.
+14. Add `doctor`.
+15. Write the integration tests with the fake Claude.
+16. Write the README and the `AGENTS.md` block.
+17. Build and perform a real test with the local Claude Code.
+18. Add a Codex installation command.
+19. Run:
+    - `gofmt`;
+    - `go test ./...`;
     - `go vet ./...`.
-20. Fournir un résumé final :
-    - fichiers créés ;
-    - architecture ;
-    - commandes d’installation ;
-    - limites restantes ;
-    - preuve qu’une session est bien reprise.
+20. Provide a final summary:
+    - files created;
+    - architecture;
+    - installation commands;
+    - remaining limitations;
+    - proof that a session is actually resumed.
 
 ---
 
-## 23. Décisions importantes à ne pas modifier sans justification
+## 23. Important decisions not to change without justification
 
-- Go est obligatoire.
-- MCP STDIO est obligatoire pour la V1.
-- Le contexte doit être conservé via le vrai `session_id` Claude et `--resume`.
-- L’association `review_id` → `claude_session_id` doit être persistée sur disque.
-- Claude est strictement en lecture seule.
-- Le serveur calcule le diff.
-- stdout est réservé au protocole MCP.
-- `claude --continue` ne doit pas être utilisé.
-- Un `review_id` ne peut pas migrer silencieusement vers un autre dépôt.
-- Les sessions concurrentes doivent être verrouillées individuellement.
-- Les retours Claude doivent être structurés et validés.
+- Go is mandatory.
+- MCP STDIO is mandatory for V1.
+- Context must be preserved via the real Claude `session_id` and `--resume`.
+- The `review_id` → `claude_session_id` association must be persisted on disk.
+- Claude is strictly read-only.
+- The server computes the diff.
+- stdout is reserved for the MCP protocol.
+- `claude --continue` must not be used.
+- A `review_id` cannot silently migrate to a different repository.
+- Concurrent sessions must be locked individually.
+- Claude's responses must be structured and validated.

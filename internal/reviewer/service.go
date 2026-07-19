@@ -87,11 +87,11 @@ func NewService(store session.SessionStore, git gitservice.GitService, client cl
 func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOutput, error) {
 	started := time.Now()
 	if in.RepositoryPath == "" || in.Goal == "" {
-		return ReviewOutput{}, apperr.New("invalid_request", "repository_path et goal sont obligatoires.", nil)
+		return ReviewOutput{}, apperr.New("invalid_request", "repository_path and goal are required.", nil)
 	}
 	reviewID, err := newUUID()
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Impossible de générer l’identifiant de revue.", err, nil)
+		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to generate the review identifier.", err, nil)
 	}
 	root, err := s.Git.Root(ctx, in.RepositoryPath)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 		in.Effort = s.DefaultEffort
 	}
 	if !config.ValidEffort(in.Effort) {
-		return ReviewOutput{}, apperr.New("invalid_request", "effort doit valoir low, medium, high, xhigh ou max.", map[string]any{"effort": in.Effort})
+		return ReviewOutput{}, apperr.New("invalid_request", "effort must be low, medium, high, xhigh, or max.", map[string]any{"effort": in.Effort})
 	}
 	if in.MaxTurns <= 0 {
 		in.MaxTurns = s.DefaultMaxTurns
@@ -133,12 +133,12 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "La réponse structurée de Claude est invalide.", err, nil)
+		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, nil)
 	}
 	now := s.Now().UTC()
 	record := session.ReviewSession{ReviewID: reviewID, ClaudeSessionID: result.SessionID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}
 	if err := s.Store.Create(ctx, record); err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Impossible de persister la session de revue.", err, nil)
+		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to persist the review session.", err, nil)
 	}
 	s.log("review_diff", reviewID, started, len(diff), len(response.Findings))
 	return ReviewOutput{ReviewID: reviewID, ClaudeSessionID: result.SessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
@@ -147,11 +147,11 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (ReviewOutput, error) {
 	started := time.Now()
 	if in.ReviewID == "" || in.Message == "" {
-		return ReviewOutput{}, apperr.New("invalid_request", "review_id et message sont obligatoires.", nil)
+		return ReviewOutput{}, apperr.New("invalid_request", "review_id and message are required.", nil)
 	}
 	unlock, ok := s.locks.try(in.ReviewID)
 	if !ok {
-		return ReviewOutput{}, apperr.New("review_busy", "Cette revue est déjà en cours d’utilisation.", nil)
+		return ReviewOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
 	}
 	defer unlock()
 	record, err := s.Store.Get(ctx, in.ReviewID)
@@ -159,7 +159,7 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 		return ReviewOutput{}, mapError(err)
 	}
 	if record.Status == session.ReviewStatusClosed {
-		return ReviewOutput{}, apperr.New("review_closed", "Cette revue est fermée.", nil)
+		return ReviewOutput{}, apperr.New("review_closed", "This review is closed.", nil)
 	}
 	if in.RepositoryPath != "" {
 		root, rootErr := s.Git.Root(ctx, in.RepositoryPath)
@@ -167,7 +167,7 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 			return ReviewOutput{}, mapError(rootErr)
 		}
 		if !samePath(root, record.RepositoryPath) {
-			return ReviewOutput{}, apperr.New("repository_mismatch", "Le dépôt demandé ne correspond pas à celui de la revue.", map[string]any{"expected": record.RepositoryPath, "actual": root})
+			return ReviewOutput{}, apperr.New("repository_mismatch", "The requested repository does not match the review repository.", map[string]any{"expected": record.RepositoryPath, "actual": root})
 		}
 	}
 	var diff string
@@ -192,11 +192,11 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "La réponse structurée de Claude est invalide.", err, nil)
+		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, nil)
 	}
 	record.UpdatedAt = s.Now().UTC()
 	if err := s.Store.Update(ctx, record); err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Impossible de mettre à jour la session de revue.", err, nil)
+		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to update the review session.", err, nil)
 	}
 	s.log("continue_review", record.ReviewID, started, len(diff), len(response.Findings))
 	return ReviewOutput{ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
@@ -212,7 +212,7 @@ func (s *Service) GetReview(ctx context.Context, id string) (session.ReviewSessi
 
 func (s *Service) ListReviews(ctx context.Context, in ListReviewsInput) ([]session.ReviewSession, error) {
 	if in.Status != "" && in.Status != session.ReviewStatusOpen && in.Status != session.ReviewStatusClosed {
-		return nil, apperr.New("invalid_request", "Le filtre status doit valoir open ou closed.", nil)
+		return nil, apperr.New("invalid_request", "The status filter must be open or closed.", nil)
 	}
 	var root string
 	if in.RepositoryPath != "" {
@@ -243,7 +243,7 @@ func (s *Service) ListReviews(ctx context.Context, in ListReviewsInput) ([]sessi
 func (s *Service) CloseReview(ctx context.Context, in CloseReviewInput) (CloseOutput, error) {
 	unlock, ok := s.locks.try(in.ReviewID)
 	if !ok {
-		return CloseOutput{}, apperr.New("review_busy", "Cette revue est déjà en cours d’utilisation.", nil)
+		return CloseOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
 	}
 	defer unlock()
 	r, err := s.Store.Get(ctx, in.ReviewID)
@@ -288,31 +288,31 @@ func mapError(err error) error {
 	}
 	switch {
 	case errors.Is(err, session.ErrNotFound):
-		return apperr.New("review_not_found", "Aucune revue ne correspond à cet identifiant.", nil)
+		return apperr.New("review_not_found", "No review matches this identifier.", nil)
 	case errors.Is(err, gitservice.ErrInvalidRepository):
-		return apperr.Wrap("invalid_repository", "Le chemin ne désigne pas un dépôt Git valide.", err, nil)
+		return apperr.Wrap("invalid_repository", "The path does not point to a valid Git repository.", err, nil)
 	case errors.Is(err, gitservice.ErrInvalidBaseRef):
-		return apperr.Wrap("invalid_base_ref", "La référence Git de base est invalide.", err, nil)
+		return apperr.Wrap("invalid_base_ref", "The Git base reference is invalid.", err, nil)
 	case errors.Is(err, gitservice.ErrDiffTooLarge):
-		return apperr.Wrap("diff_too_large", "Le diff dépasse la limite configurée ; réduisez la portée du changement.", err, nil)
+		return apperr.Wrap("diff_too_large", "The diff exceeds the configured limit; reduce the scope of the change.", err, nil)
 	case errors.Is(err, security.ErrPrivateKey):
-		return apperr.New("sensitive_content_detected", "Une clé privée complète a été détectée ; la revue est refusée.", nil)
+		return apperr.New("sensitive_content_detected", "A complete private key was detected; the review was rejected.", nil)
 	case errors.Is(err, claude.ErrTimeout):
-		return apperr.New("claude_timeout", "Claude n’a pas répondu avant le délai maximal.", nil)
+		return apperr.New("claude_timeout", "Claude did not respond before the timeout.", nil)
 	case errors.Is(err, claude.ErrOutputTooLarge):
-		return apperr.New("claude_output_too_large", "La sortie de Claude dépasse la limite configurée.", nil)
+		return apperr.New("claude_output_too_large", "Claude output exceeds the configured limit.", nil)
 	case errors.Is(err, claude.ErrSessionIDMissing):
-		return apperr.New("claude_session_id_missing", "Claude n’a retourné aucun session_id.", nil)
+		return apperr.New("claude_session_id_missing", "Claude returned no session_id.", nil)
 	case errors.Is(err, claude.ErrInvalidOutput):
-		return apperr.Wrap("invalid_claude_output", "La sortie de Claude est invalide.", err, nil)
+		return apperr.Wrap("invalid_claude_output", "Claude output is invalid.", err, nil)
 	case errors.Is(err, claude.ErrProcess):
-		return apperr.Wrap("claude_failed", "Le processus Claude a échoué.", err, nil)
+		return apperr.Wrap("claude_failed", "The Claude process failed.", err, nil)
 	case errors.Is(err, claude.ErrNotFound):
-		return apperr.New("claude_not_found", "Le binaire Claude Code est introuvable.", nil)
+		return apperr.New("claude_not_found", "The Claude Code binary was not found.", nil)
 	case errors.Is(err, claude.ErrNotAuthenticated):
-		return apperr.New("claude_not_authenticated", "Claude Code n’est pas authentifié ; exécutez claude auth login.", nil)
+		return apperr.New("claude_not_authenticated", "Claude Code is not authenticated; run claude auth login.", nil)
 	default:
-		return apperr.Wrap("storage_error", "Une opération locale a échoué.", err, nil)
+		return apperr.Wrap("storage_error", "A local operation failed.", err, nil)
 	}
 }
 

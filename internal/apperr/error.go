@@ -39,5 +39,5 @@ func From(err error) *Error {
 	if errors.As(err, &appErr) {
 		return appErr
 	}
-	return Wrap("internal_error", "Une erreur interne est survenue.", err, nil)
+	return Wrap("internal_error", "An internal error occurred.", err, nil)
 }
