@@ -46,7 +46,7 @@ printf '%%s\n' '{"type":"result","subtype":"success","session_id":"A","structure
 	storePath := filepath.Join(t.TempDir(), "sessions.json")
 	client := &claude.CLIClient{Binary: fake, Timeout: time.Second, MaxOutputBytes: 1024 * 1024}
 	newService := func() *Service {
-		return NewService(session.NewJSONStore(storePath), gitservice.NewService(1024*1024), client, "test", 3, nil)
+		return NewService(session.NewJSONStore(storePath), gitservice.NewService(1024*1024), client, "test", "fallback", "max", 3, nil)
 	}
 	first, err := newService().ReviewDiff(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "original goal"})
 	if err != nil {
@@ -54,6 +54,13 @@ printf '%%s\n' '{"type":"result","subtype":"success","session_id":"A","structure
 	}
 	if first.ReviewID == "" || first.ClaudeSessionID != "A" {
 		t.Fatalf("first=%+v", first)
+	}
+	persisted, err := session.NewJSONStore(storePath).Get(context.Background(), first.ReviewID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.FallbackModel != "fallback" || persisted.Effort != "max" {
+		t.Fatalf("model strategy not persisted: %+v", persisted)
 	}
 	second, err := newService().ContinueReview(context.Background(), ContinueReviewInput{ReviewID: first.ReviewID, Message: "follow only", RefreshDiff: true})
 	if err != nil {
@@ -82,7 +89,7 @@ func TestContinueReviewRejectsRepositoryMismatch(t *testing.T) {
 	if err := store.Create(context.Background(), session.ReviewSession{ReviewID: "R", ClaudeSessionID: "A", RepositoryPath: repo1, BaseRef: "HEAD", Model: "test", MaxTurns: 1, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	s := NewService(store, gitservice.NewService(1024), claude.FailedClient{Err: errors.New("must not run")}, "test", 1, nil)
+	s := NewService(store, gitservice.NewService(1024), claude.FailedClient{Err: errors.New("must not run")}, "test", "fallback", "max", 1, nil)
 	_, err := s.ContinueReview(context.Background(), ContinueReviewInput{ReviewID: "R", Message: "x", RepositoryPath: repo2})
 	var ae *apperr.Error
 	if !errors.As(err, &ae) || ae.Code != "repository_mismatch" {

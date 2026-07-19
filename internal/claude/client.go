@@ -23,8 +23,8 @@ var (
 )
 
 type Request struct {
-	RepositoryPath, Prompt, SystemPrompt, Schema, Model, SessionID string
-	MaxTurns                                                       int
+	RepositoryPath, Prompt, SystemPrompt, Schema, Model, FallbackModel, Effort, SessionID string
+	MaxTurns                                                                              int
 }
 
 type Client interface {
@@ -148,6 +148,12 @@ func BuildArgs(req Request) []string {
 	)
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
+	}
+	if req.FallbackModel != "" {
+		args = append(args, "--fallback-model", req.FallbackModel)
+	}
+	if req.Effort != "" {
+		args = append(args, "--effort", req.Effort)
 	}
 	if req.Schema != "" {
 		args = append(args, "--json-schema", req.Schema)

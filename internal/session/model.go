@@ -17,6 +17,8 @@ type ReviewSession struct {
 	BaseRef         string       `json:"base_ref"`
 	HeadSHAAtStart  string       `json:"head_sha_at_start"`
 	Model           string       `json:"model"`
+	FallbackModel   string       `json:"fallback_model,omitempty"`
+	Effort          string       `json:"effort,omitempty"`
 	MaxTurns        int          `json:"max_turns"`
 	Status          ReviewStatus `json:"status"`
 	CreatedAt       time.Time    `json:"created_at"`

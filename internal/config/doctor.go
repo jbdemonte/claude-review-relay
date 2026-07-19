@@ -49,7 +49,7 @@ func Doctor(ctx context.Context, cfg Config) DoctorReport {
 		add("claude_authentication", authErr, "authenticated")
 		help, helpErr := command(ctx, binary, "--help")
 		if helpErr == nil {
-			for _, flag := range []string{"--resume", "--output-format", "--permission-mode", "--tools", "--disallowedTools", "--json-schema"} {
+			for _, flag := range []string{"--resume", "--output-format", "--permission-mode", "--tools", "--disallowedTools", "--json-schema", "--fallback-model", "--effort"} {
 				if !strings.Contains(help, flag) {
 					helpErr = fmt.Errorf("required flag missing: %s", flag)
 					break

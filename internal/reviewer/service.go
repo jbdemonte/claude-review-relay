@@ -20,14 +20,16 @@ import (
 )
 
 type Service struct {
-	Store           session.SessionStore
-	Git             gitservice.GitService
-	Claude          claude.Client
-	DefaultModel    string
-	DefaultMaxTurns int
-	Now             func() time.Time
-	Logger          *slog.Logger
-	locks           sessionLocks
+	Store                session.SessionStore
+	Git                  gitservice.GitService
+	Claude               claude.Client
+	DefaultModel         string
+	DefaultFallbackModel string
+	DefaultEffort        string
+	DefaultMaxTurns      int
+	Now                  func() time.Time
+	Logger               *slog.Logger
+	locks                sessionLocks
 }
 
 type ReviewDiffInput struct {
@@ -38,6 +40,8 @@ type ReviewDiffInput struct {
 	AdditionalContext string   `json:"additional_context,omitempty"`
 	TestResults       string   `json:"test_results,omitempty"`
 	Model             string   `json:"model,omitempty"`
+	FallbackModel     string   `json:"fallback_model,omitempty"`
+	Effort            string   `json:"effort,omitempty"`
 	MaxTurns          int      `json:"max_turns,omitempty"`
 }
 
@@ -75,8 +79,8 @@ type CloseOutput struct {
 	LocalAssociationDeleted bool   `json:"local_association_deleted"`
 }
 
-func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model string, maxTurns int, logger *slog.Logger) *Service {
-	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultMaxTurns: maxTurns, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]chan struct{}{}}}
+func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model, fallbackModel, effort string, maxTurns int, logger *slog.Logger) *Service {
+	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]chan struct{}{}}}
 }
 
 func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOutput, error) {
@@ -109,11 +113,17 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	if in.Model == "" {
 		in.Model = s.DefaultModel
 	}
+	if in.FallbackModel == "" {
+		in.FallbackModel = s.DefaultFallbackModel
+	}
+	if in.Effort == "" {
+		in.Effort = s.DefaultEffort
+	}
 	if in.MaxTurns <= 0 {
 		in.MaxTurns = s.DefaultMaxTurns
 	}
 	prompt := InitialPrompt(InitialPromptInput{Goal: in.Goal, BaseRef: in.BaseRef, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: in.ReviewFocus, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, MaxTurns: in.MaxTurns})
+	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns})
 	if err != nil {
 		return ReviewOutput{}, mapError(err)
 	}
@@ -122,7 +132,7 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "La réponse structurée de Claude est invalide.", err, nil)
 	}
 	now := s.Now().UTC()
-	record := session.ReviewSession{ReviewID: reviewID, ClaudeSessionID: result.SessionID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, HeadSHAAtStart: head, Model: in.Model, MaxTurns: in.MaxTurns, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}
+	record := session.ReviewSession{ReviewID: reviewID, ClaudeSessionID: result.SessionID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}
 	if err := s.Store.Create(ctx, record); err != nil {
 		return ReviewOutput{}, apperr.Wrap("storage_error", "Impossible de persister la session de revue.", err, nil)
 	}
@@ -166,7 +176,13 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 		}
 	}
 	prompt := ContinuePrompt(in.Message, diff, in.TestResults, untracked, excluded, redactions)
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID})
+	if record.FallbackModel == "" {
+		record.FallbackModel = s.DefaultFallbackModel
+	}
+	if record.Effort == "" {
+		record.Effort = s.DefaultEffort
+	}
+	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID})
 	if err != nil {
 		return ReviewOutput{}, mapError(err)
 	}

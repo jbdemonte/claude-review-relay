@@ -48,7 +48,7 @@ func TestParseStreamFindsNestedSessionAndResultText(t *testing.T) {
 }
 
 func TestBuildArgsUsesExplicitResumeAndReadOnlyTools(t *testing.T) {
-	args := BuildArgs(Request{SessionID: "A", Prompt: "follow-up", MaxTurns: 12})
+	args := BuildArgs(Request{SessionID: "A", Prompt: "follow-up", Model: "fable", FallbackModel: "opus", Effort: "max", MaxTurns: 12})
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--resume A") {
 		t.Fatalf("args=%v", args)
@@ -58,6 +58,9 @@ func TestBuildArgsUsesExplicitResumeAndReadOnlyTools(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--tools Read,Glob,Grep") || !strings.Contains(joined, "Bash") {
 		t.Fatalf("args=%v", args)
+	}
+	if !strings.Contains(joined, "--model fable --fallback-model opus --effort max") {
+		t.Fatalf("model strategy missing: %v", args)
 	}
 	if args[len(args)-1] != "follow-up" {
 		t.Fatalf("prompt is not final arg: %v", args)

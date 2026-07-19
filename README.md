@@ -101,7 +101,8 @@ claude-reviewer serve
 ## Utilisation
 
 `review_diff` attend au minimum `repository_path` et `goal`. `base_ref` vaut
-`HEAD`, le modèle vaut `opus`, `max_turns` vaut 12. Le résultat contient un
+`HEAD`, le modèle principal vaut `fable`, le fallback vaut `opus`, l’effort vaut
+`max` et `max_turns` vaut 12. Le résultat contient un
 nouveau `review_id` et le `claude_session_id` persisté.
 
 `continue_review` attend le même `review_id` et un nouveau `message`. Avec
@@ -127,7 +128,9 @@ Créez `~/Library/Application Support/claude-reviewer/config.json` :
 ```json
 {
   "claude_binary": "/opt/homebrew/bin/claude",
-  "default_model": "opus",
+  "default_model": "fable",
+  "default_fallback_model": "opus",
+  "default_effort": "max",
   "default_max_turns": 12,
   "timeout_seconds": 600,
   "max_diff_bytes": 2097152,

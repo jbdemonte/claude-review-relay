@@ -13,6 +13,8 @@ import (
 type Config struct {
 	ClaudeBinary         string `json:"claude_binary"`
 	DefaultModel         string `json:"default_model"`
+	DefaultFallbackModel string `json:"default_fallback_model"`
+	DefaultEffort        string `json:"default_effort"`
 	DefaultMaxTurns      int    `json:"default_max_turns"`
 	TimeoutSeconds       int    `json:"timeout_seconds"`
 	MaxDiffBytes         int64  `json:"max_diff_bytes"`
@@ -28,7 +30,8 @@ func Defaults() (Config, error) {
 		return Config{}, err
 	}
 	return Config{
-		DefaultModel: "opus", DefaultMaxTurns: 12, TimeoutSeconds: 600,
+		DefaultModel: "fable", DefaultFallbackModel: "opus", DefaultEffort: "max",
+		DefaultMaxTurns: 12, TimeoutSeconds: 600,
 		MaxDiffBytes: 2 * 1024 * 1024, MaxOutputBytes: 8 * 1024 * 1024,
 		LogLevel: "info", SessionRetentionDays: 30, DataDir: dir,
 	}, nil
@@ -51,10 +54,19 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.DataDir = filepath.Dir(path)
-	if cfg.DefaultModel == "" || cfg.DefaultMaxTurns <= 0 || cfg.TimeoutSeconds <= 0 || cfg.MaxDiffBytes <= 0 || cfg.MaxOutputBytes <= 0 {
+	if cfg.DefaultModel == "" || cfg.DefaultFallbackModel == "" || !validEffort(cfg.DefaultEffort) || cfg.DefaultMaxTurns <= 0 || cfg.TimeoutSeconds <= 0 || cfg.MaxDiffBytes <= 0 || cfg.MaxOutputBytes <= 0 {
 		return Config{}, errors.New("config contains invalid zero or negative values")
 	}
 	return cfg, nil
+}
+
+func validEffort(value string) bool {
+	switch value {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
