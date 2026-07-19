@@ -3,12 +3,14 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -20,6 +22,7 @@ var (
 	ErrInvalidOutput    = errors.New("invalid claude output")
 	ErrNotFound         = errors.New("claude executable not found")
 	ErrNotAuthenticated = errors.New("claude is not authenticated")
+	ErrOutputTooLarge   = errors.New("claude output exceeded configured limit")
 )
 
 type Request struct {
@@ -37,6 +40,8 @@ type CLIClient struct {
 	MaxOutputBytes      int64
 	Logger              *slog.Logger
 	CheckAuthentication bool
+	authMu              sync.Mutex
+	authOK              bool
 }
 
 func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) {
@@ -53,16 +58,9 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 	args := BuildArgs(req)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	cmd.Dir = req.RepositoryPath
+	cmd.Stdin = strings.NewReader(req.Prompt)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return err
-		}
-		return nil
-	}
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	cmd.WaitDelay = 2 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -80,6 +78,9 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 		}
 	}
 	result, parseErr := ParseStream(stdout, c.MaxOutputBytes, debug)
+	if parseErr != nil {
+		_ = killProcessGroup(cmd)
+	}
 	waitErr := cmd.Wait()
 	if c.Logger != nil {
 		exitCode := 0
@@ -95,6 +96,9 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return result, ErrTimeout
+	}
+	if errors.Is(parseErr, ErrOutputTooLarge) {
+		return result, ErrOutputTooLarge
 	}
 	if parseErr != nil {
 		return result, fmt.Errorf("%w: %v", ErrInvalidOutput, parseErr)
@@ -115,6 +119,11 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 }
 
 func (c *CLIClient) checkAuth(ctx context.Context) error {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.authOK {
+		return nil
+	}
 	cmd := exec.CommandContext(ctx, c.Binary, "auth", "status")
 	var stdout cappedBuffer
 	stdout.limit = 16 * 1024
@@ -122,9 +131,22 @@ func (c *CLIClient) checkAuth(ctx context.Context) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%w: %v", ErrNotAuthenticated, err)
 	}
-	text := stdout.String()
-	if !strings.Contains(text, `"loggedIn": true`) && !strings.Contains(text, `"loggedIn":true`) {
+	var status struct {
+		LoggedIn *bool `json:"loggedIn"`
+	}
+	if err := json.Unmarshal([]byte(stdout.String()), &status); err == nil && status.LoggedIn != nil && !*status.LoggedIn {
 		return ErrNotAuthenticated
+	}
+	c.authOK = true
+	return nil
+}
+
+func killProcessGroup(cmd *exec.Cmd) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
 	}
 	return nil
 }
@@ -161,7 +183,7 @@ func BuildArgs(req Request) []string {
 	if req.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", req.SystemPrompt)
 	}
-	return append(args, req.Prompt)
+	return args
 }
 
 type cappedBuffer struct {

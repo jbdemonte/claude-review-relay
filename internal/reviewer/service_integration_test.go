@@ -24,18 +24,17 @@ func TestReviewAndResumeSurviveStoreRestartWithFakeClaude(t *testing.T) {
 	script := fmt.Sprintf(`#!/bin/sh
 resume="NONE"
 previous=""
-last=""
 for arg in "$@"; do
   if [ "$previous" = "--resume" ]; then resume="$arg"; fi
   previous="$arg"
-  last="$arg"
 done
+prompt=$(cat)
 printf '%%s\n' "$resume" >> %q
 if [ "$resume" = "NONE" ]; then
-  case "$last" in *"original goal"*) ;; *) exit 11;; esac
+  case "$prompt" in *"original goal"*) ;; *) exit 11;; esac
 else
-  case "$last" in *"original goal"*) exit 12;; esac
-  case "$last" in *"follow only"*) ;; *) exit 13;; esac
+  case "$prompt" in *"original goal"*) exit 12;; esac
+  case "$prompt" in *"follow only"*) ;; *) exit 13;; esac
 fi
 printf '%%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
 printf '%%s\n' '{"type":"result","subtype":"success","session_id":"A","structured_output":{"verdict":"approve","summary":"context retained","findings":[],"missing_tests":[],"previous_findings":[]}}'
@@ -98,7 +97,7 @@ func TestContinueReviewRejectsRepositoryMismatch(t *testing.T) {
 }
 
 func TestSessionLockIsPerReviewAndNonBlocking(t *testing.T) {
-	l := sessionLocks{values: map[string]chan struct{}{}}
+	l := sessionLocks{values: map[string]bool{}}
 	unlockA, ok := l.try("A")
 	if !ok {
 		t.Fatal("first lock failed")
@@ -116,6 +115,19 @@ func TestSessionLockIsPerReviewAndNonBlocking(t *testing.T) {
 		t.Fatal("released lock remains busy")
 	} else {
 		unlock()
+	}
+	if len(l.values) != 0 {
+		t.Fatalf("released locks were not pruned: %v", l.values)
+	}
+}
+
+func TestReviewDiffRejectsInvalidEffortBeforeClaude(t *testing.T) {
+	repo := integrationRepo(t)
+	s := NewService(session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json")), gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "max", 1, nil)
+	_, err := s.ReviewDiff(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test", Effort: "ultra"})
+	var ae *apperr.Error
+	if !errors.As(err, &ae) || ae.Code != "invalid_request" {
+		t.Fatalf("err=%v", err)
 	}
 }
 

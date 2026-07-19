@@ -54,13 +54,13 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.DataDir = filepath.Dir(path)
-	if cfg.DefaultModel == "" || cfg.DefaultFallbackModel == "" || !validEffort(cfg.DefaultEffort) || cfg.DefaultMaxTurns <= 0 || cfg.TimeoutSeconds <= 0 || cfg.MaxDiffBytes <= 0 || cfg.MaxOutputBytes <= 0 {
+	if cfg.DefaultModel == "" || cfg.DefaultFallbackModel == "" || !ValidEffort(cfg.DefaultEffort) || cfg.DefaultMaxTurns <= 0 || cfg.TimeoutSeconds <= 0 || cfg.MaxDiffBytes <= 0 || cfg.MaxOutputBytes <= 0 {
 		return Config{}, errors.New("config contains invalid zero or negative values")
 	}
 	return cfg, nil
 }
 
-func validEffort(value string) bool {
+func ValidEffort(value string) bool {
 	switch value {
 	case "low", "medium", "high", "xhigh", "max":
 		return true

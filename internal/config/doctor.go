@@ -41,9 +41,9 @@ func Doctor(ctx context.Context, cfg Config) DoctorReport {
 		add("claude_version", runErr, strings.TrimSpace(out))
 		authOut, authErr := command(ctx, binary, "auth", "status")
 		var status struct {
-			LoggedIn bool `json:"loggedIn"`
+			LoggedIn *bool `json:"loggedIn"`
 		}
-		if json.Unmarshal([]byte(authOut), &status) != nil || !status.LoggedIn {
+		if authErr == nil && json.Unmarshal([]byte(authOut), &status) == nil && status.LoggedIn != nil && !*status.LoggedIn {
 			authErr = fmt.Errorf("claude auth status reports loggedIn=false")
 		}
 		add("claude_authentication", authErr, "authenticated")
@@ -58,9 +58,18 @@ func Doctor(ctx context.Context, cfg Config) DoctorReport {
 		}
 		// Claude documents that --help may omit supported flags. An invalid numeric
 		// value proves that this local parser recognizes --max-turns without an API call.
-		_, probeErr := command(ctx, binary, "-p", "--max-turns", "not-a-number", "probe")
-		if probeErr == nil || !strings.Contains(probeErr.Error(), "must be a number") {
-			helpErr = fmt.Errorf("required flag unsupported: --max-turns")
+		_, probeErr := command(ctx, binary,
+			"-p", "--permission-mode", "dontAsk",
+			"--tools", "Read,Glob,Grep",
+			"--disallowedTools", "Edit,Write,NotebookEdit,Bash,WebSearch,WebFetch,mcp__*",
+			"--max-turns", "not-a-number", "probe")
+		if probeErr == nil {
+			helpErr = fmt.Errorf("--max-turns accepted a non-numeric value")
+		} else {
+			probeText := strings.ToLower(probeErr.Error())
+			if strings.Contains(probeText, "unknown option") || strings.Contains(probeText, "unknown flag") {
+				helpErr = fmt.Errorf("required CLI flag unsupported: %v", probeErr)
+			}
 		}
 		add("claude_flags", helpErr, "all required flags supported")
 	}

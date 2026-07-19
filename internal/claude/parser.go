@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 )
@@ -60,7 +59,7 @@ func ParseStream(r io.Reader, maxBytes int64, debug func(string)) (StreamResult,
 		return out, fmt.Errorf("read claude stream: %w", err)
 	}
 	if lr.N <= 0 {
-		return out, errors.New("claude output exceeded configured limit")
+		return out, fmt.Errorf("%w: maximum is %d bytes", ErrOutputTooLarge, maxBytes)
 	}
 	if len(out.StructuredOutput) == 0 && out.ResultText != "" {
 		var raw json.RawMessage

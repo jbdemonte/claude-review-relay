@@ -17,6 +17,8 @@ utilisée.
   destructive ;
 - Claude limité à `Read,Glob,Grep`, avec écriture, Bash, Web et outils MCP
   interdits ;
+- prompt et diff transmis à Claude par stdin, jamais dans la ligne de commande
+  visible par `ps` et sans dépendre de la limite macOS `ARG_MAX` ;
 - réponses imposées par JSON Schema puis validées côté Go ;
 - sessions dans `~/Library/Application Support/claude-reviewer/sessions.json`,
   écrites atomiquement avec `Sync`, renommage et permissions `0600` ;
@@ -105,6 +107,10 @@ claude-reviewer serve
 `max` et `max_turns` vaut 12. Le résultat contient un
 nouveau `review_id` et le `claude_session_id` persisté.
 
+L’effort `max` privilégie délibérément la qualité de revue au détriment du coût
+et de la latence. Un appel peut choisir un effort inférieur parmi `low`,
+`medium`, `high` et `xhigh`.
+
 `continue_review` attend le même `review_id` et un nouveau `message`. Avec
 `refresh_diff: true`, le serveur recalcule le diff et l’ajoute au seul message
 de suivi. Il recharge l’association depuis le disque et invoque exactement :
@@ -152,7 +158,7 @@ n’exposent ni stack trace, ni prompt, ni diff. Les codes incluent notamment
 `review_busy`, `repository_mismatch`, `claude_not_found`,
 `claude_not_authenticated`, `claude_timeout`, `claude_failed`,
 `claude_session_id_missing`, `invalid_claude_output`, `diff_too_large`,
-`sensitive_content_detected` et `storage_error`.
+`claude_output_too_large`, `sensitive_content_detected` et `storage_error`.
 
 ## Limites V1
 

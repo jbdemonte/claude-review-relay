@@ -25,7 +25,10 @@ func TestSanitizeDiffExcludesSensitiveFilesAndRedactsTokens(t *testing.T) {
 }
 
 func TestSanitizeDiffRejectsPrivateKey(t *testing.T) {
-	_, err := SanitizeDiff("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----")
+	// Split the marker in source so this repository can review its own diff while
+	// the runtime value still exercises a complete PEM block.
+	pem := "-----BEGIN " + "PRIVATE KEY-----\nabc\n-----END " + "PRIVATE KEY-----"
+	_, err := SanitizeDiff(pem)
 	if !errors.Is(err, ErrPrivateKey) {
 		t.Fatalf("err=%v", err)
 	}

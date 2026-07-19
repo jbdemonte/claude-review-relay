@@ -14,6 +14,7 @@ import (
 
 	"github.com/jbd/claude-reviewer/internal/apperr"
 	"github.com/jbd/claude-reviewer/internal/claude"
+	"github.com/jbd/claude-reviewer/internal/config"
 	gitservice "github.com/jbd/claude-reviewer/internal/git"
 	"github.com/jbd/claude-reviewer/internal/security"
 	"github.com/jbd/claude-reviewer/internal/session"
@@ -80,7 +81,7 @@ type CloseOutput struct {
 }
 
 func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model, fallbackModel, effort string, maxTurns int, logger *slog.Logger) *Service {
-	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]chan struct{}{}}}
+	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]bool{}}}
 }
 
 func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOutput, error) {
@@ -118,6 +119,9 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	}
 	if in.Effort == "" {
 		in.Effort = s.DefaultEffort
+	}
+	if !config.ValidEffort(in.Effort) {
+		return ReviewOutput{}, apperr.New("invalid_request", "effort doit valoir low, medium, high, xhigh ou max.", map[string]any{"effort": in.Effort})
 	}
 	if in.MaxTurns <= 0 {
 		in.MaxTurns = s.DefaultMaxTurns
@@ -295,6 +299,8 @@ func mapError(err error) error {
 		return apperr.New("sensitive_content_detected", "Une clé privée complète a été détectée ; la revue est refusée.", nil)
 	case errors.Is(err, claude.ErrTimeout):
 		return apperr.New("claude_timeout", "Claude n’a pas répondu avant le délai maximal.", nil)
+	case errors.Is(err, claude.ErrOutputTooLarge):
+		return apperr.New("claude_output_too_large", "La sortie de Claude dépasse la limite configurée.", nil)
 	case errors.Is(err, claude.ErrSessionIDMissing):
 		return apperr.New("claude_session_id_missing", "Claude n’a retourné aucun session_id.", nil)
 	case errors.Is(err, claude.ErrInvalidOutput):
@@ -324,23 +330,21 @@ func samePath(a, b string) bool {
 
 type sessionLocks struct {
 	mu     sync.Mutex
-	values map[string]chan struct{}
+	values map[string]bool
 }
 
 func (l *sessionLocks) try(id string) (func(), bool) {
 	l.mu.Lock()
-	ch := l.values[id]
-	if ch == nil {
-		ch = make(chan struct{}, 1)
-		l.values[id] = ch
-	}
-	l.mu.Unlock()
-	select {
-	case ch <- struct{}{}:
-		return func() { <-ch }, true
-	default:
+	defer l.mu.Unlock()
+	if l.values[id] {
 		return nil, false
 	}
+	l.values[id] = true
+	return func() {
+		l.mu.Lock()
+		delete(l.values, id)
+		l.mu.Unlock()
+	}, true
 }
 
 func newUUID() (string, error) {
