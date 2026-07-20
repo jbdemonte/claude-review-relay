@@ -13,6 +13,11 @@ type StreamResult struct {
 	StructuredOutput json.RawMessage
 	ResultText       string
 	EventCount       int
+	TerminalSubtype  string
+	TerminalReason   string
+	TerminalErrors   []string
+	TerminalIsError  bool
+	NumTurns         int
 }
 
 func ParseStream(r io.Reader, maxBytes int64, debug func(string)) (StreamResult, error) {
@@ -45,6 +50,20 @@ func ParseStream(r io.Reader, maxBytes int64, debug func(string)) (StreamResult,
 		}
 		m, _ := value.(map[string]any)
 		if m["type"] == "result" {
+			out.TerminalSubtype, _ = m["subtype"].(string)
+			out.TerminalReason, _ = m["terminal_reason"].(string)
+			out.TerminalIsError, _ = m["is_error"].(bool)
+			if turns, ok := m["num_turns"].(float64); ok {
+				out.NumTurns = int(turns)
+			}
+			if values, ok := m["errors"].([]any); ok {
+				out.TerminalErrors = out.TerminalErrors[:0]
+				for _, value := range values {
+					if message, ok := value.(string); ok {
+						out.TerminalErrors = append(out.TerminalErrors, message)
+					}
+				}
+			}
 			if raw, ok := m["structured_output"]; ok {
 				if b, err := json.Marshal(raw); err == nil && string(b) != "null" {
 					out.StructuredOutput = b

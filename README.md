@@ -58,9 +58,13 @@ make check
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-cp ./bin/claude-reviewer "$HOME/.local/bin/claude-reviewer"
-chmod +x "$HOME/.local/bin/claude-reviewer"
+cp ./bin/claude-reviewer "$HOME/.local/bin/claude-reviewer.new"
+chmod +x "$HOME/.local/bin/claude-reviewer.new"
+mv -f "$HOME/.local/bin/claude-reviewer.new" "$HOME/.local/bin/claude-reviewer"
 ```
+
+The final rename replaces the executable atomically, including when Codex still
+has the previous MCP binary mapped in a running process.
 
 Add `~/.local/bin` to `PATH` if necessary, then diagnose the environment:
 
@@ -70,6 +74,20 @@ claude-reviewer doctor
 
 The JSON report checks the Claude Code binary and version, authentication, Git,
 write access to the data directory, session storage, and required CLI flags.
+
+To exercise the complete production invocation against an isolated one-line Git
+diff, run the explicit smoke test. It calls the configured Claude models and can
+therefore incur cost and latency:
+
+```bash
+claude-reviewer doctor --review-smoke-test
+```
+
+The equivalent opt-in integration test against the installed Claude Code is:
+
+```bash
+CLAUDE_REVIEWER_INTEGRATION=1 go test ./internal/smoke -run TestInstalledClaudeReview
+```
 
 ## MCP Installation in Codex
 
@@ -150,12 +168,20 @@ cleanup; V1 never deletes sessions automatically.
 ## Errors
 
 Tool errors are actionable JSON (`code`, `message`, `details`) and expose no
-stack trace, prompt, or diff. Codes include `invalid_repository`,
+stack trace, prompt, or diff. Claude invocation failures include a correlation
+ID, failure stage, exit code when available, terminal reason, bounded redacted
+stderr, model, turn counts, and argument names without argument values. Codes
+include `invalid_repository`,
 `invalid_base_ref`, `review_not_found`, `review_closed`, `review_busy`,
 `repository_mismatch`, `claude_not_found`, `claude_not_authenticated`,
-`claude_timeout`, `claude_failed`, `claude_session_id_missing`,
+`claude_timeout`, `claude_max_turns`, `claude_failed`, `claude_session_id_missing`,
 `invalid_claude_output`, `diff_too_large`, `claude_output_too_large`,
 `sensitive_content_detected`, and `storage_error`.
+
+`claude_max_turns` means Claude was still reviewing when it exhausted
+`max_turns`; retry with a larger value or a narrower scope. `claude_timeout`
+means the configured `timeout_seconds` elapsed and can require the same scope
+reduction or a larger configured timeout.
 
 ## V1 Limitations
 

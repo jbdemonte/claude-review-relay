@@ -131,6 +131,91 @@ func TestReviewDiffRejectsInvalidEffortBeforeClaude(t *testing.T) {
 	}
 }
 
+func TestReviewDiffReturnsActionableClaudeFailureWithCorrelationID(t *testing.T) {
+	repo := integrationRepo(t)
+	exitCode := 1
+	runErr := &claude.RunError{
+		Kind: claude.ErrMaxTurns, Stage: claude.StageProcessExit, ExitCode: &exitCode,
+		TerminalSubtype: "error_max_turns", TerminalReason: "max_turns",
+		TerminalErrors: []string{"Reached maximum number of turns (4)"},
+		EventCount:     24, NumTurns: 5, MaxTurns: 4, Model: "sonnet",
+		ArgumentNames: []string{"-p", "--output-format", "--max-turns"},
+	}
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	s := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: runErr}, "sonnet", "opus", "high", 4, nil)
+	_, err := s.ReviewDiff(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "claude_max_turns" {
+		t.Fatalf("err=%v", err)
+	}
+	if appErr.Details["stage"] != claude.StageProcessExit || appErr.Details["terminal_reason"] != "max_turns" || appErr.Details["correlation_id"] == "" {
+		t.Fatalf("details=%v", appErr.Details)
+	}
+	if _, err := store.Get(context.Background(), appErr.Details["correlation_id"].(string)); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("failed reviews must not be persisted as open sessions: %v", err)
+	}
+}
+
+type staticClient struct {
+	result claude.StreamResult
+}
+
+func (c staticClient) Run(context.Context, claude.Request) (claude.StreamResult, error) {
+	return c.result, nil
+}
+
+type failThenClient struct {
+	err      error
+	result   claude.StreamResult
+	requests []claude.Request
+}
+
+func (c *failThenClient) Run(_ context.Context, request claude.Request) (claude.StreamResult, error) {
+	c.requests = append(c.requests, request)
+	if len(c.requests) == 1 {
+		return claude.StreamResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func TestReviewDiffLabelsResponseSchemaValidationFailure(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := staticClient{result: claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"invalid"}`)}}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "sonnet", "opus", "high", 4, nil)
+	_, err := s.ReviewDiff(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "invalid_claude_output" {
+		t.Fatalf("err=%v", err)
+	}
+	if appErr.Details["stage"] != "response_schema_validation" || appErr.Details["correlation_id"] == "" {
+		t.Fatalf("details=%v", appErr.Details)
+	}
+}
+
+func TestContinueReviewCanRetryAfterMaxTurnsFailure(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Now().UTC()
+	if err := store.Create(context.Background(), session.ReviewSession{ReviewID: "R", ClaudeSessionID: "A", RepositoryPath: repo, BaseRef: "HEAD", Model: "sonnet", FallbackModel: "opus", Effort: "high", MaxTurns: 4, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	client := &failThenClient{
+		err:    &claude.RunError{Kind: claude.ErrMaxTurns, Stage: claude.StageProcessExit, TerminalReason: "max_turns", MaxTurns: 4},
+		result: claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"ok","findings":[],"missing_tests":[]}`)},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "sonnet", "opus", "high", 4, nil)
+	if _, err := s.ContinueReview(context.Background(), ContinueReviewInput{ReviewID: "R", Message: "first"}); err == nil {
+		t.Fatal("expected max-turns failure")
+	}
+	if _, err := s.ContinueReview(context.Background(), ContinueReviewInput{ReviewID: "R", Message: "retry"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.requests) != 2 || client.requests[0].SessionID != "A" || client.requests[1].SessionID != "A" {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+}
+
 func integrationRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

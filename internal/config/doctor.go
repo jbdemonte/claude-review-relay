@@ -15,9 +15,10 @@ import (
 )
 
 type Check struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	Name    string         `json:"name"`
+	OK      bool           `json:"ok"`
+	Detail  string         `json:"detail"`
+	Details map[string]any `json:"details,omitempty"`
 }
 type DoctorReport struct {
 	OK     bool    `json:"ok"`

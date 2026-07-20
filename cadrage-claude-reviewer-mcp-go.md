@@ -651,6 +651,10 @@ It must check:
 - validity of the session storage;
 - compatibility of the required CLI flags.
 
+An explicit `doctor --review-smoke-test` mode may additionally exercise the
+complete production invocation against an isolated trivial Git diff. Because it
+calls Claude, it must not run as part of the default doctor command.
+
 MCP mode remains the default command:
 
 ```bash
@@ -771,9 +775,11 @@ Define actionable errors:
 - `claude_not_found`
 - `claude_not_authenticated`
 - `claude_timeout`
+- `claude_max_turns`
 - `claude_failed`
 - `claude_session_id_missing`
 - `invalid_claude_output`
+- `claude_output_too_large`
 - `diff_too_large`
 - `sensitive_content_detected`
 - `storage_error`

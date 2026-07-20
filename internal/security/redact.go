@@ -16,10 +16,11 @@ type Result struct {
 }
 
 var (
-	privateKeyRE = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)
-	assignmentRE = regexp.MustCompile(`(?im)(^[+ -]?\s*(?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)\s*[=:]\s*)([^\s"']+|"[^"]*"|'[^']*')`)
-	bearerRE     = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}`)
-	knownTokenRE = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b`)
+	privateKeyRE           = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)
+	assignmentRE           = regexp.MustCompile(`(?im)(^[+ -]?\s*(?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*)\s*[=:]\s*)([^\s"']+|"[^"]*"|'[^']*')`)
+	diagnosticAssignmentRE = regexp.MustCompile(`(?i)((?:[A-Z0-9_-]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Z0-9_-]*)["']?\s*[=:]\s*)[^\r\n]+`)
+	bearerRE               = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}`)
+	knownTokenRE           = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b`)
 )
 
 func SanitizeDiff(diff string) (Result, error) {
@@ -38,11 +39,24 @@ func SanitizeDiff(diff string) (Result, error) {
 		kept = append(kept, section)
 	}
 	content := strings.Join(kept, "")
-	content, n1 := replaceCount(content, assignmentRE, `${1}[REDACTED]`)
-	content, n2 := replaceCount(content, bearerRE, `${1}[REDACTED]`)
-	content, n3 := replaceCount(content, knownTokenRE, `[REDACTED]`)
-	result.Content, result.Redactions = content, n1+n2+n3
+	result.Content, result.Redactions = RedactText(content)
 	return result, nil
+}
+
+// RedactText removes common secret shapes without rejecting the input. It is
+// suitable for bounded local diagnostics that must never expose raw stderr.
+func RedactText(text string) (string, int) {
+	text, n0 := replaceCount(text, privateKeyRE, `[REDACTED PRIVATE KEY]`)
+	text, n1 := replaceCount(text, assignmentRE, `${1}[REDACTED]`)
+	text, n2 := replaceCount(text, bearerRE, `${1}[REDACTED]`)
+	text, n3 := replaceCount(text, knownTokenRE, `[REDACTED]`)
+	return text, n0 + n1 + n2 + n3
+}
+
+// RedactDiagnostic also handles secret assignments embedded in prose or JSON.
+func RedactDiagnostic(text string) string {
+	text, _ = RedactText(text)
+	return diagnosticAssignmentRE.ReplaceAllString(text, `${1}[REDACTED]`)
 }
 
 func SensitiveFilename(path string) bool {

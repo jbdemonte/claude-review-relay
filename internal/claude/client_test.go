@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const validStructured = `{"verdict":"approve","summary":"ok","findings":[],"missing_tests":[]}`
@@ -47,6 +48,21 @@ func TestParseStreamFindsNestedSessionAndResultText(t *testing.T) {
 	}
 }
 
+func TestParseStreamCapturesTerminalFailure(t *testing.T) {
+	stream := `{"type":"system","subtype":"init","session_id":"A"}` + "\n" +
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":5,"terminal_reason":"max_turns","errors":["Reached maximum number of turns (4)"]}` + "\n"
+	result, err := ParseStream(strings.NewReader(stream), 4096, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TerminalSubtype != "error_max_turns" || result.TerminalReason != "max_turns" || !result.TerminalIsError || result.NumTurns != 5 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(result.TerminalErrors) != 1 || result.TerminalErrors[0] != "Reached maximum number of turns (4)" {
+		t.Fatalf("terminal errors=%v", result.TerminalErrors)
+	}
+}
+
 func TestBuildArgsUsesExplicitResumeAndReadOnlyTools(t *testing.T) {
 	args := BuildArgs(Request{SessionID: "A", Prompt: "follow-up", Model: "fable", FallbackModel: "opus", Effort: "max", MaxTurns: 12})
 	joined := strings.Join(args, " ")
@@ -69,18 +85,112 @@ func TestBuildArgsUsesExplicitResumeAndReadOnlyTools(t *testing.T) {
 
 func TestCLIClientProcessFailureAndTimeout(t *testing.T) {
 	dir := t.TempDir()
-	fail := writeScript(t, dir, "fail", "#!/bin/sh\necho safe-error >&2\nexit 7\n")
+	fail := writeScript(t, dir, "fail", "#!/bin/sh\necho 'API_TOKEN=very-secret-value' >&2\nexit 7\n")
 	client := &CLIClient{Binary: fail, Timeout: time.Second, MaxOutputBytes: 4096}
 	_, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 1})
-	if !errors.Is(err, ErrProcess) || !strings.Contains(err.Error(), "safe-error") {
+	var runErr *RunError
+	if !errors.Is(err, ErrProcess) || !errors.As(err, &runErr) {
 		t.Fatalf("err=%v", err)
+	}
+	details := runErr.PublicDetails()
+	if details["stage"] != StageProcessExit || details["exit_code"] != 7 || details["stderr_excerpt"] != "API_TOKEN=[REDACTED]" {
+		t.Fatalf("details=%v", details)
 	}
 	slow := writeScript(t, dir, "slow", "#!/bin/sh\nsleep 5\n")
 	client.Binary, client.Timeout = slow, 50*time.Millisecond
 	_, err = client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 1})
-	if !errors.Is(err, ErrTimeout) {
+	if !errors.Is(err, ErrTimeout) || !errors.As(err, &runErr) || runErr.Stage != StageProcessExit {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+func TestCLIClientReportsMaxTurnsWithActionableDetails(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
+printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":5,"terminal_reason":"max_turns","session_id":"A","errors":["Reached maximum number of turns (4)"]}'
+exit 1
+`
+	client := &CLIClient{Binary: writeScript(t, dir, "max-turns", script), Timeout: time.Second, MaxOutputBytes: 4096}
+	_, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", Model: "sonnet", FallbackModel: "opus", Effort: "high", MaxTurns: 4})
+	var runErr *RunError
+	if !errors.Is(err, ErrMaxTurns) || !errors.As(err, &runErr) {
+		t.Fatalf("err=%v", err)
+	}
+	details := runErr.PublicDetails()
+	if details["terminal_reason"] != "max_turns" || details["terminal_subtype"] != "error_max_turns" || details["num_turns"] != 5 || details["max_turns"] != 4 || details["model"] != "sonnet" {
+		t.Fatalf("details=%v", details)
+	}
+	wantArgs := []string{"-p", "--output-format", "--verbose", "--permission-mode", "--tools", "--disallowedTools", "--max-turns", "--model", "--fallback-model", "--effort"}
+	if got := details["argument_names"]; !equalStrings(got.([]string), wantArgs) {
+		t.Fatalf("argument_names=%v", got)
+	}
+}
+
+func TestCLIClientReportsMaxTurnsWhenClaudeExitsZero(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
+printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":4,"terminal_reason":"max_turns","session_id":"A","errors":["limit reached"]}'
+`
+	client := &CLIClient{Binary: writeScript(t, dir, "max-turns-zero", script), Timeout: time.Second, MaxOutputBytes: 4096}
+	_, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 4})
+	var runErr *RunError
+	if !errors.Is(err, ErrMaxTurns) || !errors.As(err, &runErr) || runErr.ExitCode == nil || *runErr.ExitCode != 0 {
+		t.Fatalf("err=%v runErr=%+v", err, runErr)
+	}
+}
+
+func TestCLIClientKeepsStructuredOutputAtTurnLimit(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"max_turns","session_id":"A","structured_output":{"verdict":"approve","summary":"ok","findings":[],"missing_tests":[]}}'
+`
+	client := &CLIClient{Binary: writeScript(t, dir, "turn-limit-success", script), Timeout: time.Second, MaxOutputBytes: 4096}
+	result, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 4})
+	if err != nil || len(result.StructuredOutput) == 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunErrorCapsTerminalErrors(t *testing.T) {
+	messages := make([]string, 20)
+	for i := range messages {
+		messages[i] = "error"
+	}
+	client := &CLIClient{}
+	err := client.runError(Request{MaxTurns: 1}, []string{"-p"}, StreamResult{TerminalErrors: messages}, ErrProcess, StageProcessExit, errors.New("failed"), nil, "")
+	var runErr *RunError
+	if !errors.As(err, &runErr) || len(runErr.TerminalErrors) != 6 || !strings.HasPrefix(runErr.TerminalErrors[5], "[TRUNCATED:") {
+		t.Fatalf("err=%v terminal_errors=%v", err, runErr.TerminalErrors)
+	}
+}
+
+func TestSanitizeDiagnosticBoundsAndControlCharacters(t *testing.T) {
+	input := strings.Repeat("a", 1023) + "é" + "\x00\x01\x1b"
+	got := sanitizeDiagnostic(input, 1024)
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, "…") || strings.ContainsAny(got, "\x00\x01\x1b") {
+		t.Fatalf("sanitized diagnostic is invalid: %q", got)
+	}
+	if len(strings.TrimSuffix(got, "…")) != 1023 {
+		t.Fatalf("unexpected truncation length: %d", len(strings.TrimSuffix(got, "…")))
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCLIClientSendsLargePromptOnStdin(t *testing.T) {

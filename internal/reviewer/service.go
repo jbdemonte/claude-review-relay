@@ -129,11 +129,11 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	prompt := InitialPrompt(InitialPromptInput{Goal: in.Goal, BaseRef: in.BaseRef, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: in.ReviewFocus, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
 	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns})
 	if err != nil {
-		return ReviewOutput{}, mapError(err)
+		return ReviewOutput{}, s.reviewFailure("review_diff", reviewID, err)
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, nil)
+		return ReviewOutput{}, s.reviewFailure("review_diff", reviewID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
 	}
 	now := s.Now().UTC()
 	record := session.ReviewSession{ReviewID: reviewID, ClaudeSessionID: result.SessionID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}
@@ -188,11 +188,11 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	}
 	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID})
 	if err != nil {
-		return ReviewOutput{}, mapError(err)
+		return ReviewOutput{}, s.reviewFailure("continue_review", record.ReviewID, err)
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, nil)
+		return ReviewOutput{}, s.reviewFailure("continue_review", record.ReviewID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
 	}
 	record.UpdatedAt = s.Now().UTC()
 	if err := s.Store.Update(ctx, record); err != nil {
@@ -297,23 +297,51 @@ func mapError(err error) error {
 		return apperr.Wrap("diff_too_large", "The diff exceeds the configured limit; reduce the scope of the change.", err, nil)
 	case errors.Is(err, security.ErrPrivateKey):
 		return apperr.New("sensitive_content_detected", "A complete private key was detected; the review was rejected.", nil)
+	case errors.Is(err, claude.ErrMaxTurns):
+		return apperr.Wrap("claude_max_turns", "Claude reached max_turns before producing a structured review; increase max_turns or narrow the review scope.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrTimeout):
-		return apperr.New("claude_timeout", "Claude did not respond before the timeout.", nil)
+		return apperr.Wrap("claude_timeout", "Claude did not respond before the timeout; increase timeout_seconds or narrow the review scope.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrOutputTooLarge):
-		return apperr.New("claude_output_too_large", "Claude output exceeds the configured limit.", nil)
+		return apperr.Wrap("claude_output_too_large", "Claude output exceeds the configured limit.", err, claudeFailureDetails(err, claude.StageStreamParsing))
 	case errors.Is(err, claude.ErrSessionIDMissing):
-		return apperr.New("claude_session_id_missing", "Claude returned no session_id.", nil)
+		return apperr.Wrap("claude_session_id_missing", "Claude returned no session_id.", err, claudeFailureDetails(err, claude.StageMissingSessionID))
 	case errors.Is(err, claude.ErrInvalidOutput):
-		return apperr.Wrap("invalid_claude_output", "Claude output is invalid.", err, nil)
+		return apperr.Wrap("invalid_claude_output", "Claude output is invalid.", err, claudeFailureDetails(err, claude.StageStreamParsing))
 	case errors.Is(err, claude.ErrProcess):
-		return apperr.Wrap("claude_failed", "The Claude process failed.", err, nil)
+		return apperr.Wrap("claude_failed", "The Claude process exited unsuccessfully.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrNotFound):
-		return apperr.New("claude_not_found", "The Claude Code binary was not found.", nil)
+		return apperr.New("claude_not_found", "The Claude Code binary was not found.", map[string]any{"stage": claude.StageProcessStart})
 	case errors.Is(err, claude.ErrNotAuthenticated):
-		return apperr.New("claude_not_authenticated", "Claude Code is not authenticated; run claude auth login.", nil)
+		return apperr.Wrap("claude_not_authenticated", "Claude Code is not authenticated; run claude auth login.", err, claudeFailureDetails(err, claude.StageAuthentication))
 	default:
 		return apperr.Wrap("storage_error", "A local operation failed.", err, nil)
 	}
+}
+
+func claudeFailureDetails(err error, fallbackStage string) map[string]any {
+	var runErr *claude.RunError
+	if errors.As(err, &runErr) {
+		return runErr.PublicDetails()
+	}
+	return map[string]any{"stage": fallbackStage}
+}
+
+func (s *Service) reviewFailure(tool, correlationID string, err error) error {
+	mapped := mapError(err)
+	var appErr *apperr.Error
+	if !errors.As(mapped, &appErr) {
+		return mapped
+	}
+	details := make(map[string]any, len(appErr.Details)+1)
+	for key, value := range appErr.Details {
+		details[key] = value
+	}
+	details["correlation_id"] = correlationID
+	appErr.Details = details
+	if s.Logger != nil {
+		s.Logger.Error("review failed", "tool", tool, "correlation_id", correlationID, "error_code", appErr.Code, "details", details)
+	}
+	return appErr
 }
 
 func (s *Service) log(tool, reviewID string, start time.Time, diffBytes, findings int) {
