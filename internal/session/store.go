@@ -13,4 +13,5 @@ type SessionStore interface {
 	Update(context.Context, ReviewSession) error
 	Delete(context.Context, string) error
 	List(context.Context) ([]ReviewSession, error)
+	LeaseDir() string
 }

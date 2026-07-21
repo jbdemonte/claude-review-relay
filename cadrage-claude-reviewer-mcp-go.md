@@ -124,6 +124,7 @@ type SessionStore interface {
     Update(ctx context.Context, session ReviewSession) error
     Delete(ctx context.Context, reviewID string) error
     List(ctx context.Context) ([]ReviewSession, error)
+    LeaseDir() string
 }
 ```
 
@@ -133,9 +134,12 @@ Never simply use `claude --continue`, because that option resumes the most recen
 
 ## 4. MCP tools to expose
 
-### 4.1 `review_diff`
+### 4.1 `start_review` and `review_diff`
 
-Starts a new review and creates a new Claude session.
+Both start a new review and create a new Claude session. `start_review` is the
+recommended path: it persists `pending`, launches the same production review
+pipeline in a background worker, and returns immediately. `review_diff` keeps
+the original synchronous behavior for compatibility.
 
 Input:
 
@@ -156,7 +160,7 @@ Input:
   "test_results": "Optional results of tests already run",
   "model": "opus",
   "max_turns": 12,
-  "timeout_seconds": 240,
+  "timeout_seconds": 1200,
   "include_paths": ["internal/reviewer", "README.md"],
   "exclude_paths": ["internal/reviewer/testdata"]
 }
@@ -180,14 +184,22 @@ Rules:
   repository-relative paths and must be applied by Git rather than only
   described to Claude.
 - `timeout_seconds` may range from 1 through 1200 and limits the Claude
-  subprocess. It cannot extend a shorter deadline enforced by the MCP client.
+  subprocess. It cannot extend a shorter client deadline for `review_diff`,
+  while `start_review` returns before that deadline and lets the worker use the
+  full background timeout.
 - Persist a `pending` review record before starting Claude. On failure, retain
   it as `interrupted` when a Claude session ID was observed, otherwise as
   `failed`.
+- `start_review` must return `review_id`, `status`, `operation`,
+  `expected_response_sequence`, and `poll_after_seconds` without waiting for
+  Claude to finish.
+- The validated structured response, safe error details, explicit Claude
+  session ID, and response sequence must be persisted for polling.
 
-### 4.2 `continue_review`
+### 4.2 `start_continue_review` and `continue_review`
 
-Resumes the same Claude conversation.
+Both resume the same Claude conversation. `start_continue_review` is the
+recommended background form; `continue_review` remains synchronous.
 
 Input:
 
@@ -197,7 +209,7 @@ Input:
   "message": "I have fixed findings F001 and F003. Check the new diff.",
   "refresh_diff": true,
   "test_results": "Optional new results",
-  "timeout_seconds": 240
+  "timeout_seconds": 1200
 }
 ```
 
@@ -210,8 +222,24 @@ Rules:
 - return a new structured response;
 - keep the same `review_id`.
 - never resume a record that has no explicit `claude_session_id`.
+- `start_continue_review` must return immediately with the next
+  `expected_response_sequence`.
 
-### 4.3 `get_review`
+### 4.3 `get_review_status`
+
+Polls a background operation without contacting Claude. It returns `pending`
+while the worker is active. Once complete, it returns the persisted structured
+response and incremented response sequence. Interrupted and failed operations
+return their sanitized persisted error details.
+
+Polling must not cancel, restart, or otherwise mutate a live worker. Every
+operation holds an OS-backed exclusive lease derived from its `review_id`, so
+separate MCP processes cannot run the same review concurrently. At server
+startup, reconcile a stale `pending` record whose lease is no longer held to
+`interrupted` when a Claude session ID exists, otherwise to `failed`. Never
+infer worker identity from a reusable process identifier alone.
+
+### 4.4 `get_review`
 
 Returns the local metadata of a review without calling Claude.
 
@@ -239,7 +267,7 @@ Output:
 
 Do not return any secrets or the full content of the conversation.
 
-### 4.4 `list_reviews`
+### 4.5 `list_reviews`
 
 Lists persisted reviews, sorted from most recent to oldest.
 
@@ -252,7 +280,7 @@ Optional input:
 }
 ```
 
-### 4.5 `close_review`
+### 4.6 `close_review`
 
 Marks a review as closed.
 
@@ -343,6 +371,7 @@ Do not use `--dangerously-skip-permissions`.
 
 - Default timeout for a Claude call: 4 minutes, leaving headroom below the
   300-second deadline observed in Codex's MCP connector.
+- Default timeout for a background Claude call: 20 minutes.
 - Timeout configurable in the configuration file.
 - A per-call timeout cannot extend an earlier client-side MCP deadline.
 - Use `exec.CommandContext`.
@@ -640,6 +669,7 @@ Example:
   "default_effort": "max",
   "default_max_turns": 12,
   "timeout_seconds": 240,
+  "async_timeout_seconds": 1200,
   "max_diff_bytes": 2097152,
   "log_level": "info",
   "session_retention_days": 30
@@ -808,6 +838,9 @@ Define actionable errors:
 - `diff_too_large`
 - `sensitive_content_detected`
 - `storage_error`
+- `worker_failed`
+- `background_worker_stopped`
+- `server_shutting_down`
 
 Each error must include:
 
@@ -981,7 +1014,7 @@ On a small Git repository:
 The project is complete when:
 
 - the binary starts as a STDIO MCP server;
-- Codex sees the five tools;
+- Codex sees all eight tools, including the three asynchronous workflow tools;
 - an initial review produces a `review_id`;
 - the `claude_session_id` is persisted;
 - a follow-up resumes the same session with `--resume`;

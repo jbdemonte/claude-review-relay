@@ -51,7 +51,7 @@ func run() error {
 		report := config.Doctor(ctx, cfg)
 		if smokeRequested {
 			err := smoke.RunReview(ctx, cfg, logger)
-			check := config.Check{Name: "production_review_smoke_test", OK: err == nil, Detail: fmt.Sprintf("model=%s fallback_model=%s effort=%s max_turns=%d", cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns)}
+			check := config.Check{Name: "production_review_smoke_test", OK: err == nil, Detail: fmt.Sprintf("model=%s fallback_model=%s effort=%s max_turns=%d async_timeout_seconds=%d", cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.AsyncTimeoutSeconds)}
 			if err != nil {
 				report.OK = false
 				check.Detail = err.Error()
@@ -82,12 +82,22 @@ func run() error {
 	} else {
 		client = &claude.CLIClient{Binary: binary, Timeout: cfg.Timeout(), MaxOutputBytes: cfg.MaxOutputBytes, Logger: logger, CheckAuthentication: true}
 	}
-	store := session.NewJSONStore(cfg.SessionsPath())
-	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.TimeoutSeconds, logger)
-	server := mcpserver.New(service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return server.Run(ctx)
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	store := session.NewJSONStore(cfg.SessionsPath())
+	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.TimeoutSeconds, logger)
+	service.AsyncTimeoutSeconds = cfg.AsyncTimeoutSeconds
+	service.WorkerContext = workerCtx
+	if err := service.RecoverStaleWorkers(ctx); err != nil {
+		logger.Error("failed to reconcile stale background reviews; server will continue", "error", err)
+	}
+	server := mcpserver.New(service)
+	err = server.Run(ctx)
+	service.BeginShutdown()
+	cancelWorkers()
+	service.WaitForWorkers()
+	return err
 }
 
 func parseDoctorOptions(args []string) (bool, error) {

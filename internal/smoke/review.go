@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/jbd/claude-reviewer/internal/claude"
 	"github.com/jbd/claude-reviewer/internal/config"
@@ -51,7 +52,15 @@ func RunReview(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	}
 	store := session.NewJSONStore(filepath.Join(dir, "data", "sessions.json"))
 	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.TimeoutSeconds, logger)
-	_, err = service.ReviewDiff(ctx, reviewer.ReviewDiffInput{
+	service.AsyncTimeoutSeconds = cfg.AsyncTimeoutSeconds
+	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	service.WorkerContext = workerCtx
+	defer func() {
+		service.BeginShutdown()
+		cancelWorkers()
+		service.WaitForWorkers()
+	}()
+	started, err := service.StartReview(ctx, reviewer.ReviewDiffInput{
 		RepositoryPath:    dir,
 		Goal:              "Verify the complete production review invocation against this isolated one-line Go diff.",
 		ReviewFocus:       []string{"correctness"},
@@ -59,9 +68,30 @@ func RunReview(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		TestResults:       "Diagnostic fixture only; no tests are required.",
 	})
 	if err != nil {
-		return fmt.Errorf("production review smoke test: %w", err)
+		return fmt.Errorf("start production review smoke test: %w", err)
 	}
-	return nil
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		status, err := service.GetReviewStatus(ctx, started.ReviewID)
+		if err != nil {
+			return fmt.Errorf("poll production review smoke test: %w", err)
+		}
+		if status.Status != session.ReviewStatusPending {
+			if status.Status != session.ReviewStatusOpen || status.Response == nil {
+				return fmt.Errorf("production review smoke test ended with status %s and error %s", status.Status, status.LastErrorCode)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func runGit(ctx context.Context, dir string, args ...string) error {

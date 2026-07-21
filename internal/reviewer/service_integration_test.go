@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -357,8 +358,69 @@ type blockingClient struct {
 	release chan struct{}
 }
 
+type cancelAwareClient struct {
+	started chan struct{}
+}
+
+type panicClient struct{}
+
+func (panicClient) Run(context.Context, claude.Request) (claude.StreamResult, error) {
+	panic("test worker panic")
+}
+
+func (c *cancelAwareClient) Run(ctx context.Context, _ claude.Request) (claude.StreamResult, error) {
+	close(c.started)
+	<-ctx.Done()
+	return claude.StreamResult{SessionID: "A"}, &claude.RunError{Kind: claude.ErrCanceled, Stage: claude.StageProcessExit}
+}
+
 type failingUpdateStore struct {
 	session.SessionStore
+}
+
+type completingOnFirstGetStore struct {
+	session.SessionStore
+	once sync.Once
+}
+
+func (s *completingOnFirstGetStore) Get(ctx context.Context, id string) (session.ReviewSession, error) {
+	record, err := s.SessionStore.Get(ctx, id)
+	if err != nil {
+		return record, err
+	}
+	s.once.Do(func() {
+		completed := record
+		completed.Status = session.ReviewStatusOpen
+		completed.ActiveOperation = ""
+		completed.ResponseSequence = 1
+		completed.LastResponse = []byte(`{"verdict":"approve","summary":"completed","findings":[],"missing_tests":[]}`)
+		_ = s.SessionStore.Update(ctx, completed)
+	})
+	return record, nil
+}
+
+type completingOnListStore struct {
+	session.SessionStore
+	once sync.Once
+}
+
+func (s *completingOnListStore) List(ctx context.Context) ([]session.ReviewSession, error) {
+	records, err := s.SessionStore.List(ctx)
+	if err != nil {
+		return records, err
+	}
+	s.once.Do(func() {
+		if len(records) == 0 {
+			return
+		}
+		completed := records[0]
+		completed.Status = session.ReviewStatusOpen
+		completed.ActiveOperation = ""
+		completed.ResponseSequence = 1
+		completed.LastResponse = []byte(`{"verdict":"approve","summary":"completed","findings":[],"missing_tests":[]}`)
+		_ = s.SessionStore.Update(ctx, completed)
+	})
+	return records, nil
 }
 
 func (f failingUpdateStore) Update(context.Context, session.ReviewSession) error {
@@ -391,6 +453,11 @@ func TestPendingReviewCannotBeClosedWhileClaudeIsRunning(t *testing.T) {
 	if !errors.As(err, &appErr) || appErr.Code != "review_busy" {
 		t.Fatalf("err=%v", err)
 	}
+	secondService := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "high", 20, 240, nil)
+	_, err = secondService.CloseReview(context.Background(), CloseReviewInput{ReviewID: records[0].ReviewID, DeleteClaudeSession: true})
+	if !errors.As(err, &appErr) || appErr.Code != "review_busy" {
+		t.Fatalf("cross-service close err=%v", err)
+	}
 	close(client.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -411,6 +478,212 @@ func TestCompletedInitialReviewReportsRecoveryIdentifiersOnStorageFailure(t *tes
 	if appErr.Details["review_id"] == "" || appErr.Details["claude_session_id"] != "A" || appErr.Details["resumable"] != false || appErr.Details["stage"] != "session_persistence" {
 		t.Fatalf("details=%v", appErr.Details)
 	}
+}
+
+func TestAsyncReviewReturnsPendingThenPersistsStructuredResult(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &blockingClient{started: make(chan struct{}), release: make(chan struct{})}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "max", 20, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != session.ReviewStatusPending || started.Operation != "initial" || started.ExpectedResponseSequence != 1 || started.ReviewID == "" {
+		t.Fatalf("start=%+v", started)
+	}
+	<-client.started
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusPending || status.ActiveOperation != "initial" || status.Response != nil {
+		t.Fatalf("pending status=%+v err=%v", status, err)
+	}
+	close(client.release)
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ActiveOperation != "" || status.ClaudeSessionID != "A" || status.ResponseSequence != 1 || status.Response == nil || status.Response.Verdict != "approve" {
+		t.Fatalf("completed status=%+v err=%v", status, err)
+	}
+}
+
+func TestRunningAsyncReviewRejectsContinuation(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &blockingClient{started: make(chan struct{}), release: make(chan struct{})}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "max", 20, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-client.started
+	for _, run := range []func() error{
+		func() error {
+			_, err := s.ContinueReview(context.Background(), ContinueReviewInput{ReviewID: started.ReviewID, Message: "continue"})
+			return err
+		},
+		func() error {
+			_, err := s.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: started.ReviewID, Message: "continue"})
+			return err
+		},
+	} {
+		var appErr *apperr.Error
+		if err := run(); !errors.As(err, &appErr) || appErr.Code != "review_busy" {
+			t.Fatalf("err=%v", err)
+		}
+	}
+	other := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "max", 20, 240, nil)
+	_, err = other.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: started.ReviewID, Message: "continue"})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "review_busy" {
+		t.Fatalf("cross-process lease err=%v", err)
+	}
+	close(client.release)
+	s.WaitForWorkers()
+}
+
+func TestAsyncWorkerPanicPersistsFailure(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	s := NewService(store, gitservice.NewService(1024*1024), panicClient{}, "fable", "opus", "max", 20, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusFailed || status.LastErrorCode != "worker_failed" || status.LastErrorDetails["stage"] != "background_worker" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestAsyncContinuationUsesSameExplicitSessionAndSequence(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &failThenClient{
+		firstResult: claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"changes_requested","summary":"first","findings":[],"missing_tests":[]}`)},
+		result:      claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"second","findings":[],"missing_tests":[],"previous_findings":[]}`)},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "max", 20, 240, nil)
+	first, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	continuation, err := s.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: first.ReviewID, Message: "verify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continuation.ClaudeSessionID != "A" || continuation.ExpectedResponseSequence != 2 {
+		t.Fatalf("continuation=%+v", continuation)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), first.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ClaudeSessionID != "A" || status.ResponseSequence != 2 || status.Response == nil || status.Response.Summary != "second" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if len(client.requests) != 2 || client.requests[0].SessionID != "" || client.requests[1].SessionID != "A" {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+	if client.requests[0].Timeout != 1200*time.Second || client.requests[1].Timeout != 1200*time.Second {
+		t.Fatalf("async timeouts=%v, %v", client.requests[0].Timeout, client.requests[1].Timeout)
+	}
+}
+
+func TestAsyncWorkerCancellationPersistsResumableSession(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &cancelAwareClient{started: make(chan struct{})}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "max", 20, 240, nil)
+	s.WorkerContext = workerCtx
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-client.started
+	cancel()
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusInterrupted || status.ClaudeSessionID != "A" || status.LastErrorCode != "claude_canceled" || status.LastErrorDetails["resumable"] != true {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestRecoverStaleWorkersReconcilesDeadBackgroundWorker(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Now().UTC()
+	if err := store.Create(context.Background(), session.ReviewSession{ReviewID: "R", RepositoryPath: repo, Status: session.ReviewStatusPending, ActiveOperation: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "max", 20, 240, nil)
+	if err := s.RecoverStaleWorkers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := s.GetReviewStatus(context.Background(), "R")
+	if err != nil || status.Status != session.ReviewStatusFailed || status.ActiveOperation != "" || status.LastErrorCode != "background_worker_stopped" || status.LastErrorDetails["resumable"] != false {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestGetReviewStatusRechecksStateWhileHoldingLease(t *testing.T) {
+	base := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Now().UTC()
+	if err := base.Create(context.Background(), session.ReviewSession{ReviewID: "R", Status: session.ReviewStatusPending, ActiveOperation: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	store := &completingOnFirstGetStore{SessionStore: base}
+	s := NewService(store, nil, nil, "fable", "opus", "max", 20, 240, nil)
+	status, err := s.GetReviewStatus(context.Background(), "R")
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ResponseSequence != 1 || status.Response == nil {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestRecoverStaleWorkersDoesNotOverwriteConcurrentCompletion(t *testing.T) {
+	base := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Now().UTC()
+	if err := base.Create(context.Background(), session.ReviewSession{ReviewID: "R", Status: session.ReviewStatusPending, ActiveOperation: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	store := &completingOnListStore{SessionStore: base}
+	s := NewService(store, nil, nil, "fable", "opus", "max", 20, 240, nil)
+	if err := s.RecoverStaleWorkers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := base.Get(context.Background(), "R")
+	if err != nil || record.Status != session.ReviewStatusOpen || record.ResponseSequence != 1 || len(record.LastResponse) == 0 {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+}
+
+func TestAsyncReviewDerivesFailureAfterTerminalPersistenceFailure(t *testing.T) {
+	repo := integrationRepo(t)
+	baseStore := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	store := failingUpdateStore{SessionStore: baseStore}
+	client := staticClient{result: claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"ok","findings":[],"missing_tests":[]}`)}}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "max", 20, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusFailed || status.LastErrorCode != "background_worker_stopped" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestStartReviewRejectedAfterShutdownWithoutWaitGroupRace(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	s := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "max", 20, 240, nil)
+	s.BeginShutdown()
+	_, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test"})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "server_shutting_down" {
+		t.Fatalf("err=%v", err)
+	}
+	s.WaitForWorkers()
 }
 
 func integrationRepo(t *testing.T) string {

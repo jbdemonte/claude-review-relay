@@ -20,20 +20,24 @@ For every non-trivial change:
 
 1. Implement the change.
 2. Run the relevant tests, linting, and type checking.
-3. Call `claude-reviewer.review_diff` with literal `include_paths` for the files
-   under review, `max_turns: 20`, and `timeout_seconds: 240` for interactive
-   Codex sessions.
+3. Call `claude-reviewer.start_review` with literal `include_paths` for the
+   files under review, `max_turns: 20`, and `timeout_seconds: 1200`.
 4. Provide a precise goal and the test results.
-5. Analyze each finding instead of accepting it blindly.
-6. Fix confirmed critical-, high-, and medium-severity findings.
-7. Prepare a factual technical response for incorrect findings.
-8. Call `claude-reviewer.continue_review` with the same `review_id`.
-9. Ask Claude to verify the fixes and reassess previous findings.
-10. Confirm that the continuation returns the same `claude_session_id`.
-11. Stop after two complete cycles unless a critical issue remains.
-12. Call `claude-reviewer.close_review` after the final accepted verdict.
-13. Do not treat Claude approval as a substitute for tests.
-14. Claude is a read-only reviewer; Codex remains the only agent that modifies the repository.
+5. Poll `claude-reviewer.get_review_status` at the returned
+   `poll_after_seconds` interval until the status is no longer `pending`.
+6. Analyze each finding instead of accepting it blindly.
+7. Fix confirmed critical-, high-, and medium-severity findings.
+8. Prepare a factual technical response for incorrect findings.
+9. Call `claude-reviewer.start_continue_review` with the same `review_id`,
+   `refresh_diff: true`, and a request to verify the fixes.
+10. Poll until the status is no longer `pending`, then require the returned
+    `expected_response_sequence`; report a terminal error instead of polling
+    indefinitely if that sequence was not produced.
+11. Confirm that the continuation returns the same `claude_session_id`.
+12. Stop after two completed review cycles unless a critical issue remains.
+13. Call `claude-reviewer.close_review` after the final accepted verdict.
+14. Do not treat Claude approval as a substitute for tests.
+15. Claude is a read-only reviewer; Codex remains the only agent that modifies the repository.
 
 ## 1. Think Before Coding
 

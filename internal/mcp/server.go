@@ -13,12 +13,36 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 type Server struct{ sdk *mcpsdk.Server }
 
+type reviewMetadata struct {
+	ReviewID          string               `json:"review_id"`
+	ClaudeSessionID   string               `json:"claude_session_id,omitempty"`
+	RepositoryPath    string               `json:"repository_path"`
+	Goal              string               `json:"goal"`
+	BaseRef           string               `json:"base_ref"`
+	IncludePaths      []string             `json:"include_paths,omitempty"`
+	ExcludePaths      []string             `json:"exclude_paths,omitempty"`
+	HeadSHAAtStart    string               `json:"head_sha_at_start"`
+	Model             string               `json:"model"`
+	FallbackModel     string               `json:"fallback_model,omitempty"`
+	Effort            string               `json:"effort,omitempty"`
+	MaxTurns          int                  `json:"max_turns"`
+	TimeoutSeconds    int                  `json:"timeout_seconds,omitempty"`
+	Status            session.ReviewStatus `json:"status"`
+	ActiveOperation   string               `json:"active_operation,omitempty"`
+	ResponseSequence  int                  `json:"response_sequence"`
+	LastErrorCode     string               `json:"last_error_code,omitempty"`
+	LastExcludedFiles []string             `json:"last_excluded_files,omitempty"`
+	RedactionCount    int                  `json:"redaction_count"`
+	CreatedAt         time.Time            `json:"created_at"`
+	UpdatedAt         time.Time            `json:"updated_at"`
+}
+
 type reviewsOutput struct {
-	Reviews []session.ReviewSession `json:"reviews"`
+	Reviews []reviewMetadata `json:"reviews"`
 }
 
 func New(service *reviewer.Service) *Server {
@@ -35,19 +59,48 @@ func New(service *reviewer.Service) *Server {
 		out, err := service.ContinueReview(ctx, in)
 		return nil, out, safeError(err)
 	})
-	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "get_review", Description: "Return local metadata for one persisted review without calling Claude.", Annotations: readOnlyAnnotations("Get review metadata")}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.GetReviewInput) (*mcpsdk.CallToolResult, session.ReviewSession, error) {
-		out, err := service.GetReview(ctx, in.ReviewID)
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "start_review", Description: "Persist and start a review in the background, returning immediately with a review_id for polling.", Annotations: mutatingAnnotations("Start background Claude review", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ReviewDiffInput) (*mcpsdk.CallToolResult, reviewer.AsyncStartOutput, error) {
+		out, err := service.StartReview(ctx, in)
 		return nil, out, safeError(err)
+	})
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "start_continue_review", Description: "Resume the persisted explicit Claude session in the background and return immediately.", Annotations: mutatingAnnotations("Start background Claude continuation", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ContinueReviewInput) (*mcpsdk.CallToolResult, reviewer.AsyncStartOutput, error) {
+		out, err := service.StartContinueReview(ctx, in)
+		return nil, out, safeError(err)
+	})
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "get_review_status", Description: "Poll a background review and return its persisted status, latest structured response, or actionable error.", Annotations: readOnlyAnnotations("Get background review status")}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.GetReviewInput) (*mcpsdk.CallToolResult, reviewer.ReviewStatusOutput, error) {
+		out, err := service.GetReviewStatus(ctx, in.ReviewID)
+		return nil, out, safeError(err)
+	})
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "get_review", Description: "Return local metadata for one persisted review without calling Claude.", Annotations: readOnlyAnnotations("Get review metadata")}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.GetReviewInput) (*mcpsdk.CallToolResult, reviewMetadata, error) {
+		out, err := service.GetReview(ctx, in.ReviewID)
+		return nil, metadata(out), safeError(err)
 	})
 	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "list_reviews", Description: "List persisted reviews, newest first, optionally filtered by repository and status.", Annotations: readOnlyAnnotations("List reviews")}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ListReviewsInput) (*mcpsdk.CallToolResult, reviewsOutput, error) {
 		out, err := service.ListReviews(ctx, in)
-		return nil, reviewsOutput{Reviews: out}, safeError(err)
+		reviews := make([]reviewMetadata, 0, len(out))
+		for _, record := range out {
+			reviews = append(reviews, metadata(record))
+		}
+		return nil, reviewsOutput{Reviews: reviews}, safeError(err)
 	})
 	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "close_review", Description: "Close a review or delete only its local association. Native Claude session data is not deleted in V1.", Annotations: mutatingAnnotations("Close review", true, false)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.CloseReviewInput) (*mcpsdk.CallToolResult, reviewer.CloseOutput, error) {
 		out, err := service.CloseReview(ctx, in)
 		return nil, out, safeError(err)
 	})
 	return &Server{sdk: sdk}
+}
+
+func metadata(record session.ReviewSession) reviewMetadata {
+	return reviewMetadata{
+		ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID,
+		RepositoryPath: record.RepositoryPath, Goal: record.Goal, BaseRef: record.BaseRef,
+		IncludePaths: append([]string(nil), record.IncludePaths...), ExcludePaths: append([]string(nil), record.ExcludePaths...),
+		HeadSHAAtStart: record.HeadSHAAtStart, Model: record.Model, FallbackModel: record.FallbackModel,
+		Effort: record.Effort, MaxTurns: record.MaxTurns, TimeoutSeconds: record.TimeoutSeconds,
+		Status: record.Status, ActiveOperation: record.ActiveOperation, ResponseSequence: record.ResponseSequence,
+		LastErrorCode: record.LastErrorCode, LastExcludedFiles: append([]string(nil), record.LastExcludedFiles...),
+		RedactionCount: record.LastRedactionCount, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+	}
 }
 
 func readOnlyAnnotations(title string) *mcpsdk.ToolAnnotations {

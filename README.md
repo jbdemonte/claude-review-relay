@@ -9,8 +9,9 @@ used.
 ## Core Guarantees
 
 - MCP over STDIO, with stdout reserved for the protocol and JSON logs on stderr;
-- five tools: `review_diff`, `continue_review`, `get_review`, `list_reviews`,
-  and `close_review`;
+- eight tools: asynchronous `start_review`, `start_continue_review`, and
+  `get_review_status`; synchronous compatibility tools `review_diff` and
+  `continue_review`; plus `get_review`, `list_reviews`, and `close_review`;
 - explicit MCP annotations: reads are marked read-only and closing is marked
   destructive so Codex approval policies behave correctly;
 - diffs are computed locally with separate Git arguments, without a shell or
@@ -118,6 +119,40 @@ claude-reviewer serve
 
 ## Usage
 
+### Recommended asynchronous workflow
+
+Use the asynchronous tools for Fable with maximum effort. `start_review`
+validates and persists the request, launches Claude in a background worker, and
+returns immediately with `review_id`, `status: pending`,
+`expected_response_sequence`, and `poll_after_seconds`. It defaults to a
+20-minute Claude subprocess timeout, independently of Codex's synchronous MCP
+request deadline.
+
+Poll `get_review_status` no more frequently than `poll_after_seconds` until the
+status is no longer `pending`:
+
+- `open` means a validated structured `response` is available;
+- `interrupted` means the worker stopped but the explicit Claude session is
+  resumable;
+- `failed` means no resumable Claude session was captured;
+- `closed` means the review was explicitly finalized.
+
+After applying confirmed findings, call `start_continue_review` with the same
+`review_id` and `refresh_diff: true`. It returns the same
+`claude_session_id` and the next `expected_response_sequence`. Poll until that
+operation is no longer `pending`, then require that sequence. If the operation
+ends without it, report the returned terminal error instead of polling again.
+Close the review after accepting the final verdict.
+Every continuation still invokes exactly `--resume <claude_session_id>`.
+
+If the MCP server shuts down cleanly while a worker is running, the Claude
+process is canceled and the review becomes `interrupted` or `failed`. An
+OS-backed per-review lease prevents concurrent MCP processes from running the
+same review. A stale `pending` record left by an abrupt stop is reconciled when
+the MCP server next starts, without relying on reusable process identifiers.
+
+### Synchronous compatibility workflow
+
 `review_diff` requires at least `repository_path` and `goal`. `base_ref`
 defaults to `HEAD`, the primary model to `fable`, the fallback model to `opus`,
 the effort to `max`, `max_turns` to 12, and `timeout_seconds` to the configured
@@ -142,7 +177,7 @@ that synchronous MCP call wait for 20 minutes. For interactive calls, use a
 value below the connector deadline (for example, 240), a literal path scope,
 and lower effort only when latency matters more than maximum review quality.
 
-`continue_review` requires the same `review_id` and a new `message`, and can
+The synchronous `continue_review` requires the same `review_id` and a new `message`, and can
 override `timeout_seconds` for that call. With
 `refresh_diff: true`, the server recomputes the diff and adds it only to the
 follow-up message. It reloads the association from disk and invokes exactly:
@@ -167,7 +202,7 @@ the final accepted verdict. With
 `delete_claude_session: true`, V1 deletes only the local association, not native
 Claude Code data.
 
-When the MCP client supplies a progress token, long review calls emit an initial
+When the MCP client supplies a progress token, long synchronous review calls emit an initial
 progress notification and a heartbeat every 15 seconds. These notifications
 improve visibility but are not guaranteed to reset a client-side deadline.
 
@@ -183,6 +218,7 @@ Create `~/Library/Application Support/claude-reviewer/config.json`:
   "default_effort": "max",
   "default_max_turns": 12,
   "timeout_seconds": 240,
+  "async_timeout_seconds": 1200,
   "max_diff_bytes": 2097152,
   "max_output_bytes": 8388608,
   "log_level": "info",
@@ -206,7 +242,10 @@ include `invalid_repository`,
 `repository_mismatch`, `claude_not_found`, `claude_not_authenticated`,
 `claude_timeout`, `claude_canceled`, `claude_max_turns`, `claude_failed`, `claude_session_id_missing`,
 `invalid_claude_output`, `diff_too_large`, `claude_output_too_large`,
-`sensitive_content_detected`, and `storage_error`.
+`sensitive_content_detected`, `storage_error`, `worker_failed`,
+`background_worker_stopped`, and `server_shutting_down`. The last three codes
+identify an unexpected background-worker exit, a stale operation recovered
+after its lease disappeared, and a start rejected during orderly shutdown.
 
 `claude_max_turns` means Claude was still reviewing when it exhausted
 `max_turns`; retry with a larger value or a narrower scope. `claude_timeout`

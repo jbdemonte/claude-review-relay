@@ -17,6 +17,7 @@ type Config struct {
 	DefaultEffort        string `json:"default_effort"`
 	DefaultMaxTurns      int    `json:"default_max_turns"`
 	TimeoutSeconds       int    `json:"timeout_seconds"`
+	AsyncTimeoutSeconds  int    `json:"async_timeout_seconds"`
 	MaxDiffBytes         int64  `json:"max_diff_bytes"`
 	MaxOutputBytes       int64  `json:"max_output_bytes"`
 	LogLevel             string `json:"log_level"`
@@ -31,7 +32,7 @@ func Defaults() (Config, error) {
 	}
 	return Config{
 		DefaultModel: "fable", DefaultFallbackModel: "opus", DefaultEffort: "max",
-		DefaultMaxTurns: 12, TimeoutSeconds: 240,
+		DefaultMaxTurns: 12, TimeoutSeconds: 240, AsyncTimeoutSeconds: 1200,
 		MaxDiffBytes: 2 * 1024 * 1024, MaxOutputBytes: 8 * 1024 * 1024,
 		LogLevel: "info", SessionRetentionDays: 30, DataDir: dir,
 	}, nil
@@ -54,10 +55,38 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.DataDir = filepath.Dir(path)
-	if cfg.DefaultModel == "" || cfg.DefaultFallbackModel == "" || !ValidEffort(cfg.DefaultEffort) || cfg.DefaultMaxTurns <= 0 || cfg.TimeoutSeconds <= 0 || cfg.MaxDiffBytes <= 0 || cfg.MaxOutputBytes <= 0 {
-		return Config{}, errors.New("config contains invalid zero or negative values")
+	if err := validate(cfg); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func validate(cfg Config) error {
+	if cfg.DefaultModel == "" {
+		return errors.New("config default_model must not be empty")
+	}
+	if cfg.DefaultFallbackModel == "" {
+		return errors.New("config default_fallback_model must not be empty")
+	}
+	if !ValidEffort(cfg.DefaultEffort) {
+		return fmt.Errorf("config default_effort %q must be low, medium, high, xhigh, or max", cfg.DefaultEffort)
+	}
+	if cfg.DefaultMaxTurns <= 0 {
+		return errors.New("config default_max_turns must be greater than zero")
+	}
+	if cfg.TimeoutSeconds < 1 || cfg.TimeoutSeconds > 1200 {
+		return fmt.Errorf("config timeout_seconds must be between 1 and 1200; got %d", cfg.TimeoutSeconds)
+	}
+	if cfg.AsyncTimeoutSeconds < 1 || cfg.AsyncTimeoutSeconds > 1200 {
+		return fmt.Errorf("config async_timeout_seconds must be between 1 and 1200; got %d", cfg.AsyncTimeoutSeconds)
+	}
+	if cfg.MaxDiffBytes <= 0 {
+		return errors.New("config max_diff_bytes must be greater than zero")
+	}
+	if cfg.MaxOutputBytes <= 0 {
+		return errors.New("config max_output_bytes must be greater than zero")
+	}
+	return nil
 }
 
 func ValidEffort(value string) bool {

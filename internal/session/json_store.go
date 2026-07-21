@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 )
 
 type JSONStore struct {
@@ -67,6 +68,11 @@ func NewJSONStore(path string) *JSONStore { return &JSONStore{path: path} }
 func (s *JSONStore) Create(ctx context.Context, session ReviewSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -86,6 +92,11 @@ func (s *JSONStore) Create(ctx context.Context, session ReviewSession) error {
 func (s *JSONStore) Get(ctx context.Context, id string) (ReviewSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(false)
+	if err != nil {
+		return ReviewSession{}, err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return ReviewSession{}, err
 	}
@@ -104,6 +115,11 @@ func (s *JSONStore) Get(ctx context.Context, id string) (ReviewSession, error) {
 func (s *JSONStore) Update(ctx context.Context, session ReviewSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -123,6 +139,11 @@ func (s *JSONStore) Update(ctx context.Context, session ReviewSession) error {
 func (s *JSONStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -142,6 +163,11 @@ func (s *JSONStore) Delete(ctx context.Context, id string) error {
 func (s *JSONStore) List(ctx context.Context) ([]ReviewSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(false)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -221,9 +247,41 @@ func (s *JSONStore) save(d diskData) error {
 func (s *JSONStore) Validate(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	release, err := s.lockFile(false)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := s.load()
+	_, err = s.load()
 	return err
+}
+
+func (s *JSONStore) LeaseDir() string {
+	return filepath.Join(filepath.Dir(s.path), "leases")
+}
+
+func (s *JSONStore) lockFile(exclusive bool) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return nil, fmt.Errorf("create data directory for lock: %w", err)
+	}
+	path := filepath.Join(filepath.Dir(s.path), ".sessions.lock")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open sessions lock: %w", err)
+	}
+	mode := syscall.LOCK_SH
+	if exclusive {
+		mode = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(file.Fd()), mode); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock sessions store: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
 }

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDefaultsUseStrongestReviewStrategy(t *testing.T) {
 	cfg, err := Defaults()
@@ -12,6 +15,21 @@ func TestDefaultsUseStrongestReviewStrategy(t *testing.T) {
 	}
 	if cfg.TimeoutSeconds != 240 {
 		t.Fatalf("unexpected interactive timeout: %d", cfg.TimeoutSeconds)
+	}
+	if cfg.AsyncTimeoutSeconds != 1200 {
+		t.Fatalf("unexpected asynchronous timeout: %d", cfg.AsyncTimeoutSeconds)
+	}
+}
+
+func TestValidateReportsSpecificTimeoutField(t *testing.T) {
+	cfg, err := Defaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AsyncTimeoutSeconds = 1201
+	err = validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "async_timeout_seconds") || !strings.Contains(err.Error(), "1201") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

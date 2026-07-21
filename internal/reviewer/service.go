@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,9 +30,14 @@ type Service struct {
 	DefaultEffort         string
 	DefaultMaxTurns       int
 	DefaultTimeoutSeconds int
+	AsyncTimeoutSeconds   int
+	WorkerContext         context.Context
 	Now                   func() time.Time
 	Logger                *slog.Logger
 	locks                 sessionLocks
+	workerMu              sync.Mutex
+	shuttingDown          bool
+	workerWG              sync.WaitGroup
 }
 
 type ReviewDiffInput struct {
@@ -85,46 +91,115 @@ type CloseOutput struct {
 	LocalAssociationDeleted bool   `json:"local_association_deleted"`
 }
 
+type AsyncStartOutput struct {
+	ReviewID                 string               `json:"review_id"`
+	ClaudeSessionID          string               `json:"claude_session_id,omitempty"`
+	Status                   session.ReviewStatus `json:"status"`
+	Operation                string               `json:"operation"`
+	ExpectedResponseSequence int                  `json:"expected_response_sequence"`
+	PollAfterSeconds         int                  `json:"poll_after_seconds"`
+}
+
+type ReviewStatusOutput struct {
+	ReviewID         string               `json:"review_id"`
+	ClaudeSessionID  string               `json:"claude_session_id,omitempty"`
+	Status           session.ReviewStatus `json:"status"`
+	ActiveOperation  string               `json:"active_operation,omitempty"`
+	ResponseSequence int                  `json:"response_sequence"`
+	Response         *ReviewResponse      `json:"response,omitempty"`
+	ExcludedFiles    []string             `json:"excluded_files,omitempty"`
+	RedactionCount   int                  `json:"redaction_count"`
+	LastErrorCode    string               `json:"last_error_code,omitempty"`
+	LastErrorDetails map[string]any       `json:"last_error_details,omitempty"`
+	CreatedAt        time.Time            `json:"created_at"`
+	UpdatedAt        time.Time            `json:"updated_at"`
+}
+
+type preparedReview struct {
+	record         session.ReviewSession
+	request        claude.Request
+	excludedFiles  []string
+	redactionCount int
+	diffBytes      int
+	release        func()
+}
+
 func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model, fallbackModel, effort string, maxTurns, timeoutSeconds int, logger *slog.Logger) *Service {
-	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, DefaultTimeoutSeconds: timeoutSeconds, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]bool{}}}
+	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, DefaultTimeoutSeconds: timeoutSeconds, AsyncTimeoutSeconds: 1200, WorkerContext: context.Background(), Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]bool{}}}
 }
 
 func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOutput, error) {
-	started := time.Now()
+	prepared, err := s.prepareInitialReview(ctx, in, s.DefaultTimeoutSeconds)
+	if err != nil {
+		return ReviewOutput{}, err
+	}
+	defer prepared.release()
+	return s.executeReview(ctx, "review_diff", prepared)
+}
+
+func (s *Service) StartReview(ctx context.Context, in ReviewDiffInput) (AsyncStartOutput, error) {
+	prepared, err := s.prepareInitialReview(ctx, in, s.AsyncTimeoutSeconds)
+	if err != nil {
+		return AsyncStartOutput{}, err
+	}
+	out := AsyncStartOutput{ReviewID: prepared.record.ReviewID, Status: session.ReviewStatusPending, Operation: "initial", ExpectedResponseSequence: 1, PollAfterSeconds: 15}
+	if err := s.launchReview("start_review", prepared); err != nil {
+		return AsyncStartOutput{}, err
+	}
+	return out, nil
+}
+
+func (s *Service) prepareInitialReview(ctx context.Context, in ReviewDiffInput, defaultTimeoutSeconds int) (*preparedReview, error) {
 	if in.RepositoryPath == "" || in.Goal == "" {
-		return ReviewOutput{}, apperr.New("invalid_request", "repository_path and goal are required.", nil)
+		return nil, apperr.New("invalid_request", "repository_path and goal are required.", nil)
 	}
 	reviewID, err := newUUID()
 	if err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to generate the review identifier.", err, nil)
+		return nil, apperr.Wrap("storage_error", "Failed to generate the review identifier.", err, nil)
 	}
 	unlock, ok := s.locks.try(reviewID)
 	if !ok {
-		return ReviewOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
+		return nil, apperr.New("review_busy", "This review is already in use.", nil)
 	}
-	defer unlock()
+	lease, err := session.AcquireReviewLease(s.Store.LeaseDir(), reviewID)
+	if err != nil {
+		unlock()
+		return nil, apperr.Wrap("storage_error", "Failed to acquire the review worker lease.", err, map[string]any{"review_id": reviewID})
+	}
+	release := func() {
+		if err := lease.Release(); err != nil && s.Logger != nil {
+			s.Logger.Error("failed to release review lease", "review_id", reviewID, "error", err)
+		}
+		unlock()
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			release()
+		}
+	}()
 	root, err := s.Git.Root(ctx, in.RepositoryPath)
 	if err != nil {
-		return ReviewOutput{}, mapError(err)
+		return nil, mapError(err)
 	}
 	if in.BaseRef == "" {
 		in.BaseRef = "HEAD"
 	}
 	diff, untracked, excluded, redactions, err := s.prepareDiff(ctx, root, in.BaseRef, in.IncludePaths, in.ExcludePaths)
 	if err != nil {
-		return ReviewOutput{}, err
+		return nil, err
 	}
 	if diff == "" && len(untracked) == 0 {
 		details := map[string]any{"include_paths": in.IncludePaths, "exclude_paths": in.ExcludePaths}
 		if len(excluded) > 0 {
 			details["sensitive_excluded_files"] = excluded
-			return ReviewOutput{}, apperr.New("empty_review_scope", "The selected path scope contains only files excluded by the sensitive-content policy.", details)
+			return nil, apperr.New("empty_review_scope", "The selected path scope contains only files excluded by the sensitive-content policy.", details)
 		}
-		return ReviewOutput{}, apperr.New("empty_review_scope", "The selected path scope contains no tracked diff or untracked files.", details)
+		return nil, apperr.New("empty_review_scope", "The selected path scope contains no tracked diff or untracked files.", details)
 	}
 	head, err := s.Git.HeadSHA(ctx, root)
 	if err != nil {
-		return ReviewOutput{}, mapError(err)
+		return nil, mapError(err)
 	}
 	if len(in.ReviewFocus) == 0 {
 		in.ReviewFocus = []string{"correctness", "regressions", "architecture", "performance", "security", "tests"}
@@ -139,65 +214,162 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 		in.Effort = s.DefaultEffort
 	}
 	if !config.ValidEffort(in.Effort) {
-		return ReviewOutput{}, apperr.New("invalid_request", "effort must be low, medium, high, xhigh, or max.", map[string]any{"effort": in.Effort})
+		return nil, apperr.New("invalid_request", "effort must be low, medium, high, xhigh, or max.", map[string]any{"effort": in.Effort})
 	}
 	if in.MaxTurns <= 0 {
 		in.MaxTurns = s.DefaultMaxTurns
 	}
-	if err := s.resolveTimeout(&in.TimeoutSeconds); err != nil {
-		return ReviewOutput{}, err
+	if err := s.resolveTimeoutWithDefault(&in.TimeoutSeconds, defaultTimeoutSeconds); err != nil {
+		return nil, err
 	}
 	now := s.Now().UTC()
-	record := session.ReviewSession{ReviewID: reviewID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, IncludePaths: append([]string(nil), in.IncludePaths...), ExcludePaths: append([]string(nil), in.ExcludePaths...), HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, TimeoutSeconds: in.TimeoutSeconds, Status: session.ReviewStatusPending, CreatedAt: now, UpdatedAt: now}
+	record := session.ReviewSession{ReviewID: reviewID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, IncludePaths: append([]string(nil), in.IncludePaths...), ExcludePaths: append([]string(nil), in.ExcludePaths...), HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, TimeoutSeconds: in.TimeoutSeconds, Status: session.ReviewStatusPending, ActiveOperation: "initial", LastExcludedFiles: append([]string(nil), excluded...), LastRedactionCount: redactions, CreatedAt: now, UpdatedAt: now}
 	if err := s.Store.Create(ctx, record); err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to persist the pending review.", err, nil)
+		return nil, apperr.Wrap("storage_error", "Failed to persist the pending review.", err, nil)
 	}
 	prompt := InitialPrompt(InitialPromptInput{Goal: in.Goal, BaseRef: in.BaseRef, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: in.ReviewFocus, IncludePaths: in.IncludePaths, ExcludePaths: in.ExcludePaths, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Timeout: time.Duration(in.TimeoutSeconds) * time.Second})
+	keepLock = true
+	return &preparedReview{record: record, request: claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Timeout: time.Duration(in.TimeoutSeconds) * time.Second}, excludedFiles: excluded, redactionCount: redactions, diffBytes: len(diff), release: release}, nil
+}
+
+func (s *Service) executeReview(ctx context.Context, tool string, prepared *preparedReview) (ReviewOutput, error) {
+	started := time.Now()
+	result, err := s.Claude.Run(ctx, prepared.request)
 	if err != nil {
-		return ReviewOutput{}, s.persistReviewFailure(ctx, "review_diff", &record, result.SessionID, err)
+		return ReviewOutput{}, s.persistReviewFailure(ctx, tool, &prepared.record, result.SessionID, err)
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, s.persistReviewFailure(ctx, "review_diff", &record, result.SessionID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
+		return ReviewOutput{}, s.persistReviewFailure(ctx, tool, &prepared.record, result.SessionID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
 	}
-	record.ClaudeSessionID = result.SessionID
-	record.Status = session.ReviewStatusOpen
-	record.UpdatedAt = s.Now().UTC()
-	if err := s.updateDetached(ctx, record); err != nil {
-		return ReviewOutput{}, s.completedPersistenceFailure("review_diff", record, false, err)
+	sessionID := result.SessionID
+	if sessionID == "" {
+		sessionID = prepared.request.SessionID
 	}
-	s.log("review_diff", reviewID, started, len(diff), len(response.Findings))
-	return ReviewOutput{ReviewID: reviewID, ClaudeSessionID: result.SessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
+	prepared.record.ClaudeSessionID = sessionID
+	prepared.record.Status = session.ReviewStatusOpen
+	prepared.record.ActiveOperation = ""
+	prepared.record.ResponseSequence++
+	prepared.record.LastResponse = append(json.RawMessage(nil), result.StructuredOutput...)
+	prepared.record.LastErrorCode = ""
+	prepared.record.LastErrorDetails = nil
+	prepared.record.LastErrorAt = nil
+	prepared.record.UpdatedAt = s.Now().UTC()
+	if err := s.updateDetached(ctx, prepared.record); err != nil {
+		return ReviewOutput{}, s.completedPersistenceFailure(tool, prepared.record, prepared.request.SessionID != "", err)
+	}
+	s.log(tool, prepared.record.ReviewID, started, prepared.diffBytes, len(response.Findings))
+	return ReviewOutput{ReviewID: prepared.record.ReviewID, ClaudeSessionID: sessionID, Response: response, ExcludedFiles: prepared.excludedFiles, RedactionCount: prepared.redactionCount}, nil
+}
+
+func (s *Service) launchReview(tool string, prepared *preparedReview) error {
+	workerCtx := s.WorkerContext
+	if workerCtx == nil {
+		workerCtx = context.Background()
+	}
+	s.workerMu.Lock()
+	if s.shuttingDown {
+		s.workerMu.Unlock()
+		err := apperr.New("server_shutting_down", "The MCP server is shutting down and cannot start another background review.", map[string]any{"review_id": prepared.record.ReviewID})
+		persisted := s.persistReviewFailure(workerCtx, tool, &prepared.record, prepared.record.ClaudeSessionID, err)
+		prepared.release()
+		return persisted
+	}
+	s.workerWG.Add(1)
+	s.workerMu.Unlock()
+	go func() {
+		defer s.workerWG.Done()
+		defer prepared.release()
+		defer func() {
+			if recover() != nil {
+				_ = s.persistReviewFailure(workerCtx, tool, &prepared.record, prepared.record.ClaudeSessionID, apperr.New("worker_failed", "The background review worker stopped unexpectedly.", map[string]any{"stage": "background_worker"}))
+			}
+		}()
+		_, _ = s.executeReview(workerCtx, tool, prepared)
+	}()
+	return nil
+}
+
+func (s *Service) BeginShutdown() {
+	s.workerMu.Lock()
+	s.shuttingDown = true
+	s.workerMu.Unlock()
+}
+
+func (s *Service) WaitForWorkers() {
+	s.workerWG.Wait()
 }
 
 func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (ReviewOutput, error) {
-	started := time.Now()
+	prepared, err := s.prepareContinuation(ctx, in, s.DefaultTimeoutSeconds)
+	if err != nil {
+		return ReviewOutput{}, err
+	}
+	defer prepared.release()
+	return s.executeReview(ctx, "continue_review", prepared)
+}
+
+func (s *Service) StartContinueReview(ctx context.Context, in ContinueReviewInput) (AsyncStartOutput, error) {
+	if in.TimeoutSeconds == 0 {
+		in.TimeoutSeconds = s.AsyncTimeoutSeconds
+	}
+	prepared, err := s.prepareContinuation(ctx, in, s.AsyncTimeoutSeconds)
+	if err != nil {
+		return AsyncStartOutput{}, err
+	}
+	out := AsyncStartOutput{ReviewID: prepared.record.ReviewID, ClaudeSessionID: prepared.record.ClaudeSessionID, Status: session.ReviewStatusPending, Operation: "continuation", ExpectedResponseSequence: prepared.record.ResponseSequence + 1, PollAfterSeconds: 15}
+	if err := s.launchReview("start_continue_review", prepared); err != nil {
+		return AsyncStartOutput{}, err
+	}
+	return out, nil
+}
+
+func (s *Service) prepareContinuation(ctx context.Context, in ContinueReviewInput, defaultTimeoutSeconds int) (*preparedReview, error) {
 	if in.ReviewID == "" || in.Message == "" {
-		return ReviewOutput{}, apperr.New("invalid_request", "review_id and message are required.", nil)
+		return nil, apperr.New("invalid_request", "review_id and message are required.", nil)
 	}
 	unlock, ok := s.locks.try(in.ReviewID)
 	if !ok {
-		return ReviewOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
+		return nil, apperr.New("review_busy", "This review is already in use.", nil)
 	}
-	defer unlock()
+	lease, err := session.AcquireReviewLease(s.Store.LeaseDir(), in.ReviewID)
+	if errors.Is(err, session.ErrLeaseBusy) {
+		unlock()
+		return nil, apperr.New("review_busy", "This review is already running in another MCP server process.", map[string]any{"review_id": in.ReviewID})
+	}
+	if err != nil {
+		unlock()
+		return nil, apperr.Wrap("storage_error", "Failed to acquire the review worker lease.", err, map[string]any{"review_id": in.ReviewID})
+	}
+	release := func() {
+		if err := lease.Release(); err != nil && s.Logger != nil {
+			s.Logger.Error("failed to release review lease", "review_id", in.ReviewID, "error", err)
+		}
+		unlock()
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			release()
+		}
+	}()
 	record, err := s.Store.Get(ctx, in.ReviewID)
 	if err != nil {
-		return ReviewOutput{}, mapError(err)
+		return nil, mapError(err)
 	}
 	if record.Status == session.ReviewStatusClosed {
-		return ReviewOutput{}, apperr.New("review_closed", "This review is closed.", nil)
+		return nil, apperr.New("review_closed", "This review is closed.", nil)
 	}
 	if record.ClaudeSessionID == "" {
-		return ReviewOutput{}, apperr.New("review_not_resumable", "Claude did not provide a session_id before this review stopped; start a new review.", map[string]any{"review_id": record.ReviewID, "status": record.Status})
+		return nil, apperr.New("review_not_resumable", "Claude did not provide a session_id before this review stopped; start a new review.", map[string]any{"review_id": record.ReviewID, "status": record.Status})
 	}
 	if in.RepositoryPath != "" {
 		root, rootErr := s.Git.Root(ctx, in.RepositoryPath)
 		if rootErr != nil {
-			return ReviewOutput{}, mapError(rootErr)
+			return nil, mapError(rootErr)
 		}
 		if !samePath(root, record.RepositoryPath) {
-			return ReviewOutput{}, apperr.New("repository_mismatch", "The requested repository does not match the review repository.", map[string]any{"expected": record.RepositoryPath, "actual": root})
+			return nil, apperr.New("repository_mismatch", "The requested repository does not match the review repository.", map[string]any{"expected": record.RepositoryPath, "actual": root})
 		}
 	}
 	var diff string
@@ -206,7 +378,7 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	if in.RefreshDiff {
 		diff, untracked, excluded, redactions, err = s.prepareDiff(ctx, record.RepositoryPath, record.BaseRef, record.IncludePaths, record.ExcludePaths)
 		if err != nil {
-			return ReviewOutput{}, err
+			return nil, err
 		}
 	}
 	prompt := ContinuePrompt(in.Message, diff, in.TestResults, record.IncludePaths, record.ExcludePaths, untracked, excluded, redactions, in.RefreshDiff)
@@ -219,26 +391,24 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	if in.TimeoutSeconds == 0 {
 		in.TimeoutSeconds = record.TimeoutSeconds
 	}
-	if err := s.resolveTimeout(&in.TimeoutSeconds); err != nil {
-		return ReviewOutput{}, err
+	if err := s.resolveTimeoutWithDefault(&in.TimeoutSeconds, defaultTimeoutSeconds); err != nil {
+		return nil, err
 	}
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID, Timeout: time.Duration(in.TimeoutSeconds) * time.Second})
-	if err != nil {
-		return ReviewOutput{}, s.persistReviewFailure(ctx, "continue_review", &record, result.SessionID, err)
-	}
-	response, err := ParseResponse(result.StructuredOutput)
-	if err != nil {
-		return ReviewOutput{}, s.persistReviewFailure(ctx, "continue_review", &record, result.SessionID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
-	}
+	record.Status = session.ReviewStatusPending
+	record.ActiveOperation = "continuation"
 	record.UpdatedAt = s.Now().UTC()
-	record.Status = session.ReviewStatusOpen
 	record.LastErrorCode = ""
+	record.LastErrorDetails = nil
 	record.LastErrorAt = nil
-	if err := s.updateDetached(ctx, record); err != nil {
-		return ReviewOutput{}, s.completedPersistenceFailure("continue_review", record, true, err)
+	if in.RefreshDiff {
+		record.LastExcludedFiles = append([]string(nil), excluded...)
+		record.LastRedactionCount = redactions
 	}
-	s.log("continue_review", record.ReviewID, started, len(diff), len(response.Findings))
-	return ReviewOutput{ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
+	if err := s.updateDetached(ctx, record); err != nil {
+		return nil, apperr.Wrap("storage_error", "Failed to mark the review continuation as pending.", err, map[string]any{"review_id": record.ReviewID})
+	}
+	keepLock = true
+	return &preparedReview{record: record, request: claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID, Timeout: time.Duration(in.TimeoutSeconds) * time.Second}, excludedFiles: excluded, redactionCount: redactions, diffBytes: len(diff), release: release}, nil
 }
 
 func (s *Service) GetReview(ctx context.Context, id string) (session.ReviewSession, error) {
@@ -247,6 +417,106 @@ func (s *Service) GetReview(ctx context.Context, id string) (session.ReviewSessi
 		return r, mapError(err)
 	}
 	return r, nil
+}
+
+func (s *Service) GetReviewStatus(ctx context.Context, id string) (ReviewStatusOutput, error) {
+	record, err := s.GetReview(ctx, id)
+	if err != nil {
+		return ReviewStatusOutput{}, err
+	}
+	if record.Status == session.ReviewStatusPending {
+		lease, leaseErr := session.AcquireReviewLease(s.Store.LeaseDir(), record.ReviewID)
+		if errors.Is(leaseErr, session.ErrLeaseBusy) {
+			return statusOutput(record)
+		}
+		if leaseErr != nil {
+			return ReviewStatusOutput{}, apperr.Wrap("storage_error", "Failed to inspect the review worker lease.", leaseErr, map[string]any{"review_id": record.ReviewID})
+		}
+		defer func() { _ = lease.Release() }()
+		record, err = s.GetReview(ctx, id)
+		if err != nil {
+			return ReviewStatusOutput{}, err
+		}
+		if record.Status == session.ReviewStatusPending {
+			s.markStoppedWorker(&record)
+		}
+	}
+	return statusOutput(record)
+}
+
+func (s *Service) RecoverStaleWorkers(ctx context.Context) error {
+	records, err := s.Store.List(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	for _, record := range records {
+		if record.Status != session.ReviewStatusPending {
+			continue
+		}
+		lease, leaseErr := session.AcquireReviewLease(s.Store.LeaseDir(), record.ReviewID)
+		if errors.Is(leaseErr, session.ErrLeaseBusy) {
+			continue
+		}
+		if leaseErr != nil {
+			if s.Logger != nil {
+				s.Logger.Error("failed to inspect a background worker lease", "review_id", record.ReviewID, "error", leaseErr)
+			}
+			continue
+		}
+		fresh, getErr := s.Store.Get(ctx, record.ReviewID)
+		if getErr != nil {
+			_ = lease.Release()
+			if s.Logger != nil {
+				s.Logger.Error("failed to reload a pending review during reconciliation", "review_id", record.ReviewID, "error", getErr)
+			}
+			continue
+		}
+		if fresh.Status != session.ReviewStatusPending {
+			_ = lease.Release()
+			continue
+		}
+		s.markStoppedWorker(&fresh)
+		if err := s.updateDetached(ctx, fresh); err != nil {
+			if s.Logger != nil {
+				s.Logger.Error("failed to reconcile a stopped background worker", "review_id", fresh.ReviewID, "error", err)
+			}
+		}
+		_ = lease.Release()
+	}
+	return nil
+}
+
+func (s *Service) markStoppedWorker(record *session.ReviewSession) {
+	now := s.Now().UTC()
+	record.ActiveOperation = ""
+	record.UpdatedAt = now
+	record.LastErrorCode = "background_worker_stopped"
+	record.LastErrorAt = &now
+	record.LastErrorDetails = map[string]any{"stage": "background_worker", "review_id": record.ReviewID, "resumable": record.ClaudeSessionID != ""}
+	if record.ClaudeSessionID == "" {
+		record.Status = session.ReviewStatusFailed
+	} else {
+		record.Status = session.ReviewStatusInterrupted
+	}
+}
+
+func statusOutput(record session.ReviewSession) (ReviewStatusOutput, error) {
+	output := ReviewStatusOutput{
+		ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID,
+		Status: record.Status, ActiveOperation: record.ActiveOperation,
+		ResponseSequence: record.ResponseSequence,
+		ExcludedFiles:    append([]string(nil), record.LastExcludedFiles...), RedactionCount: record.LastRedactionCount,
+		LastErrorCode: record.LastErrorCode, LastErrorDetails: cloneDetails(record.LastErrorDetails),
+		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+	}
+	if len(record.LastResponse) > 0 {
+		response, err := ParseResponse(record.LastResponse)
+		if err != nil {
+			return ReviewStatusOutput{}, apperr.Wrap("storage_error", "The persisted review response is invalid.", err, map[string]any{"review_id": record.ReviewID})
+		}
+		output.Response = &response
+	}
+	return output, nil
 }
 
 func (s *Service) ListReviews(ctx context.Context, in ListReviewsInput) ([]session.ReviewSession, error) {
@@ -285,6 +555,14 @@ func (s *Service) CloseReview(ctx context.Context, in CloseReviewInput) (CloseOu
 		return CloseOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
 	}
 	defer unlock()
+	lease, leaseErr := session.AcquireReviewLease(s.Store.LeaseDir(), in.ReviewID)
+	if errors.Is(leaseErr, session.ErrLeaseBusy) {
+		return CloseOutput{}, apperr.New("review_busy", "This review is already running in a background worker.", map[string]any{"review_id": in.ReviewID})
+	}
+	if leaseErr != nil {
+		return CloseOutput{}, apperr.Wrap("storage_error", "Failed to acquire the review worker lease.", leaseErr, map[string]any{"review_id": in.ReviewID})
+	}
+	defer func() { _ = lease.Release() }()
 	r, err := s.Store.Get(ctx, in.ReviewID)
 	if err != nil {
 		return CloseOutput{}, mapError(err)
@@ -292,6 +570,9 @@ func (s *Service) CloseReview(ctx context.Context, in CloseReviewInput) (CloseOu
 	if in.DeleteClaudeSession {
 		if err := s.Store.Delete(ctx, in.ReviewID); err != nil {
 			return CloseOutput{}, mapError(err)
+		}
+		if err := session.RemoveReviewLeaseFile(s.Store.LeaseDir(), in.ReviewID); err != nil && s.Logger != nil {
+			s.Logger.Warn("failed to remove deleted review lease file", "review_id", in.ReviewID, "error", err)
 		}
 		return CloseOutput{ReviewID: in.ReviewID, Status: "deleted", LocalAssociationDeleted: true}, nil
 	}
@@ -399,6 +680,7 @@ func (s *Service) persistReviewFailure(ctx context.Context, tool string, record 
 	}
 	now := s.Now().UTC()
 	record.UpdatedAt = now
+	record.ActiveOperation = ""
 	record.LastErrorCode = appErr.Code
 	record.LastErrorAt = &now
 	if record.ClaudeSessionID == "" {
@@ -415,20 +697,31 @@ func (s *Service) persistReviewFailure(ctx context.Context, tool string, record 
 	if record.ClaudeSessionID != "" {
 		details["claude_session_id"] = record.ClaudeSessionID
 	}
+	appErr.Details = details
+	record.LastErrorDetails = cloneDetails(details)
 	if persistErr := s.updateDetached(ctx, *record); persistErr != nil {
 		details["persistence_error"] = "failed to update the local review record"
 		if s.Logger != nil {
 			s.Logger.Error("failed to persist interrupted review", "review_id", record.ReviewID, "error", persistErr)
 		}
 	}
-	appErr.Details = details
 	return appErr
 }
 
 func (s *Service) updateDetached(ctx context.Context, record session.ReviewSession) error {
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
-	return s.Store.Update(persistCtx, record)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		lastErr = s.Store.Update(persistCtx, record)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < 2 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 func (s *Service) completedPersistenceFailure(tool string, record session.ReviewSession, resumable bool, err error) error {
@@ -444,9 +737,9 @@ func (s *Service) completedPersistenceFailure(tool string, record session.Review
 	return apperr.Wrap("storage_error", "Claude completed, but the local review record could not be updated.", err, details)
 }
 
-func (s *Service) resolveTimeout(seconds *int) error {
+func (s *Service) resolveTimeoutWithDefault(seconds *int, defaultSeconds int) error {
 	if *seconds == 0 {
-		*seconds = s.DefaultTimeoutSeconds
+		*seconds = defaultSeconds
 	}
 	if *seconds == 0 {
 		*seconds = 600
@@ -455,6 +748,17 @@ func (s *Service) resolveTimeout(seconds *int) error {
 		return apperr.New("invalid_request", "timeout_seconds must be between 1 and 1200.", map[string]any{"timeout_seconds": *seconds})
 	}
 	return nil
+}
+
+func cloneDetails(details map[string]any) map[string]any {
+	if len(details) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(details))
+	for key, value := range details {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func validReviewStatus(status session.ReviewStatus) bool {
