@@ -3,6 +3,9 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
 
 	"github.com/jbd/claude-reviewer/internal/apperr"
 	"github.com/jbd/claude-reviewer/internal/reviewer"
@@ -10,7 +13,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type Server struct{ sdk *mcpsdk.Server }
 
@@ -20,11 +23,15 @@ type reviewsOutput struct {
 
 func New(service *reviewer.Service) *Server {
 	sdk := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "claude-reviewer", Title: "Claude Reviewer", Version: Version}, &mcpsdk.ServerOptions{Instructions: "Independent read-only code review through persistent Claude Code sessions."})
-	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "review_diff", Description: "Start a new independent review of the server-computed Git diff and persist its Claude session.", Annotations: mutatingAnnotations("Start Claude review", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ReviewDiffInput) (*mcpsdk.CallToolResult, reviewer.ReviewOutput, error) {
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "review_diff", Description: "Start a new independent review of the server-computed Git diff and persist its Claude session.", Annotations: mutatingAnnotations("Start Claude review", false, true)}, func(ctx context.Context, req *mcpsdk.CallToolRequest, in reviewer.ReviewDiffInput) (*mcpsdk.CallToolResult, reviewer.ReviewOutput, error) {
+		stopProgress := startProgress(ctx, req, "Claude review")
+		defer stopProgress()
 		out, err := service.ReviewDiff(ctx, in)
 		return nil, out, safeError(err)
 	})
-	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "continue_review", Description: "Resume exactly the same Claude conversation using the persisted explicit session_id.", Annotations: mutatingAnnotations("Continue Claude review", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ContinueReviewInput) (*mcpsdk.CallToolResult, reviewer.ReviewOutput, error) {
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "continue_review", Description: "Resume exactly the same Claude conversation using the persisted explicit session_id.", Annotations: mutatingAnnotations("Continue Claude review", false, true)}, func(ctx context.Context, req *mcpsdk.CallToolRequest, in reviewer.ContinueReviewInput) (*mcpsdk.CallToolResult, reviewer.ReviewOutput, error) {
+		stopProgress := startProgress(ctx, req, "Claude review continuation")
+		defer stopProgress()
 		out, err := service.ContinueReview(ctx, in)
 		return nil, out, safeError(err)
 	})
@@ -53,6 +60,45 @@ func mutatingAnnotations(title string, destructive, openWorld bool) *mcpsdk.Tool
 }
 
 func (s *Server) Run(ctx context.Context) error { return s.sdk.Run(ctx, &mcpsdk.StdioTransport{}) }
+
+func startProgress(ctx context.Context, req *mcpsdk.CallToolRequest, operation string) func() {
+	if req == nil || req.Session == nil || req.Params == nil {
+		return func() {}
+	}
+	token := req.Params.GetProgressToken()
+	if token == nil {
+		return func() {}
+	}
+	progressCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		progress := func(message string) {
+			_ = req.Session.NotifyProgress(progressCtx, &mcpsdk.ProgressNotificationParams{
+				ProgressToken: token,
+				Progress:      time.Since(started).Seconds(),
+				Message:       message,
+			})
+		}
+		progress(operation + " started")
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case <-ticker.C:
+				progress(fmt.Sprintf("%s is still running (%s elapsed)", operation, time.Since(started).Round(time.Second)))
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
 
 type publicError struct {
 	Code    string         `json:"code"`

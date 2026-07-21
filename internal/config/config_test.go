@@ -10,6 +10,9 @@ func TestDefaultsUseStrongestReviewStrategy(t *testing.T) {
 	if cfg.DefaultModel != "fable" || cfg.DefaultFallbackModel != "opus" || cfg.DefaultEffort != "max" {
 		t.Fatalf("unexpected model strategy: primary=%q fallback=%q effort=%q", cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort)
 	}
+	if cfg.TimeoutSeconds != 240 {
+		t.Fatalf("unexpected interactive timeout: %d", cfg.TimeoutSeconds)
+	}
 }
 
 func TestValidEffort(t *testing.T) {

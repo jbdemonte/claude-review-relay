@@ -31,7 +31,7 @@ func Defaults() (Config, error) {
 	}
 	return Config{
 		DefaultModel: "fable", DefaultFallbackModel: "opus", DefaultEffort: "max",
-		DefaultMaxTurns: 12, TimeoutSeconds: 600,
+		DefaultMaxTurns: 12, TimeoutSeconds: 240,
 		MaxDiffBytes: 2 * 1024 * 1024, MaxOutputBytes: 8 * 1024 * 1024,
 		LogLevel: "info", SessionRetentionDays: 30, DataDir: dir,
 	}, nil

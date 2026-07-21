@@ -21,16 +21,17 @@ import (
 )
 
 type Service struct {
-	Store                session.SessionStore
-	Git                  gitservice.GitService
-	Claude               claude.Client
-	DefaultModel         string
-	DefaultFallbackModel string
-	DefaultEffort        string
-	DefaultMaxTurns      int
-	Now                  func() time.Time
-	Logger               *slog.Logger
-	locks                sessionLocks
+	Store                 session.SessionStore
+	Git                   gitservice.GitService
+	Claude                claude.Client
+	DefaultModel          string
+	DefaultFallbackModel  string
+	DefaultEffort         string
+	DefaultMaxTurns       int
+	DefaultTimeoutSeconds int
+	Now                   func() time.Time
+	Logger                *slog.Logger
+	locks                 sessionLocks
 }
 
 type ReviewDiffInput struct {
@@ -38,12 +39,15 @@ type ReviewDiffInput struct {
 	Goal              string   `json:"goal" jsonschema:"functional goal of the implemented change"`
 	BaseRef           string   `json:"base_ref,omitempty" jsonschema:"Git base reference, defaults to HEAD"`
 	ReviewFocus       []string `json:"review_focus,omitempty"`
+	IncludePaths      []string `json:"include_paths,omitempty" jsonschema:"repository-relative files or directories to include in the server-computed diff"`
+	ExcludePaths      []string `json:"exclude_paths,omitempty" jsonschema:"repository-relative files or directories to exclude from the server-computed diff"`
 	AdditionalContext string   `json:"additional_context,omitempty"`
 	TestResults       string   `json:"test_results,omitempty"`
 	Model             string   `json:"model,omitempty"`
 	FallbackModel     string   `json:"fallback_model,omitempty"`
 	Effort            string   `json:"effort,omitempty"`
 	MaxTurns          int      `json:"max_turns,omitempty"`
+	TimeoutSeconds    int      `json:"timeout_seconds,omitempty" jsonschema:"Claude subprocess timeout in seconds, from 1 to 1200; cannot extend the MCP client's own deadline"`
 }
 
 type ContinueReviewInput struct {
@@ -52,6 +56,7 @@ type ContinueReviewInput struct {
 	RefreshDiff    bool   `json:"refresh_diff,omitempty"`
 	TestResults    string `json:"test_results,omitempty"`
 	RepositoryPath string `json:"repository_path,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Claude subprocess timeout in seconds, from 1 to 1200; cannot extend the MCP client's own deadline"`
 }
 
 type GetReviewInput struct {
@@ -80,8 +85,8 @@ type CloseOutput struct {
 	LocalAssociationDeleted bool   `json:"local_association_deleted"`
 }
 
-func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model, fallbackModel, effort string, maxTurns int, logger *slog.Logger) *Service {
-	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]bool{}}}
+func NewService(store session.SessionStore, git gitservice.GitService, client claude.Client, model, fallbackModel, effort string, maxTurns, timeoutSeconds int, logger *slog.Logger) *Service {
+	return &Service{Store: store, Git: git, Claude: client, DefaultModel: model, DefaultFallbackModel: fallbackModel, DefaultEffort: effort, DefaultMaxTurns: maxTurns, DefaultTimeoutSeconds: timeoutSeconds, Logger: logger, Now: time.Now, locks: sessionLocks{values: map[string]bool{}}}
 }
 
 func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOutput, error) {
@@ -93,6 +98,11 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	if err != nil {
 		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to generate the review identifier.", err, nil)
 	}
+	unlock, ok := s.locks.try(reviewID)
+	if !ok {
+		return ReviewOutput{}, apperr.New("review_busy", "This review is already in use.", nil)
+	}
+	defer unlock()
 	root, err := s.Git.Root(ctx, in.RepositoryPath)
 	if err != nil {
 		return ReviewOutput{}, mapError(err)
@@ -100,9 +110,17 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	if in.BaseRef == "" {
 		in.BaseRef = "HEAD"
 	}
-	diff, untracked, excluded, redactions, err := s.prepareDiff(ctx, root, in.BaseRef)
+	diff, untracked, excluded, redactions, err := s.prepareDiff(ctx, root, in.BaseRef, in.IncludePaths, in.ExcludePaths)
 	if err != nil {
 		return ReviewOutput{}, err
+	}
+	if diff == "" && len(untracked) == 0 {
+		details := map[string]any{"include_paths": in.IncludePaths, "exclude_paths": in.ExcludePaths}
+		if len(excluded) > 0 {
+			details["sensitive_excluded_files"] = excluded
+			return ReviewOutput{}, apperr.New("empty_review_scope", "The selected path scope contains only files excluded by the sensitive-content policy.", details)
+		}
+		return ReviewOutput{}, apperr.New("empty_review_scope", "The selected path scope contains no tracked diff or untracked files.", details)
 	}
 	head, err := s.Git.HeadSHA(ctx, root)
 	if err != nil {
@@ -126,19 +144,28 @@ func (s *Service) ReviewDiff(ctx context.Context, in ReviewDiffInput) (ReviewOut
 	if in.MaxTurns <= 0 {
 		in.MaxTurns = s.DefaultMaxTurns
 	}
-	prompt := InitialPrompt(InitialPromptInput{Goal: in.Goal, BaseRef: in.BaseRef, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: in.ReviewFocus, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns})
+	if err := s.resolveTimeout(&in.TimeoutSeconds); err != nil {
+		return ReviewOutput{}, err
+	}
+	now := s.Now().UTC()
+	record := session.ReviewSession{ReviewID: reviewID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, IncludePaths: append([]string(nil), in.IncludePaths...), ExcludePaths: append([]string(nil), in.ExcludePaths...), HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, TimeoutSeconds: in.TimeoutSeconds, Status: session.ReviewStatusPending, CreatedAt: now, UpdatedAt: now}
+	if err := s.Store.Create(ctx, record); err != nil {
+		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to persist the pending review.", err, nil)
+	}
+	prompt := InitialPrompt(InitialPromptInput{Goal: in.Goal, BaseRef: in.BaseRef, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: in.ReviewFocus, IncludePaths: in.IncludePaths, ExcludePaths: in.ExcludePaths, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
+	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: root, Prompt: prompt, SystemPrompt: SystemPrompt, Schema: ResponseSchema, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Timeout: time.Duration(in.TimeoutSeconds) * time.Second})
 	if err != nil {
-		return ReviewOutput{}, s.reviewFailure("review_diff", reviewID, err)
+		return ReviewOutput{}, s.persistReviewFailure(ctx, "review_diff", &record, result.SessionID, err)
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, s.reviewFailure("review_diff", reviewID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
+		return ReviewOutput{}, s.persistReviewFailure(ctx, "review_diff", &record, result.SessionID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
 	}
-	now := s.Now().UTC()
-	record := session.ReviewSession{ReviewID: reviewID, ClaudeSessionID: result.SessionID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, Status: session.ReviewStatusOpen, CreatedAt: now, UpdatedAt: now}
-	if err := s.Store.Create(ctx, record); err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to persist the review session.", err, nil)
+	record.ClaudeSessionID = result.SessionID
+	record.Status = session.ReviewStatusOpen
+	record.UpdatedAt = s.Now().UTC()
+	if err := s.updateDetached(ctx, record); err != nil {
+		return ReviewOutput{}, s.completedPersistenceFailure("review_diff", record, false, err)
 	}
 	s.log("review_diff", reviewID, started, len(diff), len(response.Findings))
 	return ReviewOutput{ReviewID: reviewID, ClaudeSessionID: result.SessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
@@ -161,6 +188,9 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	if record.Status == session.ReviewStatusClosed {
 		return ReviewOutput{}, apperr.New("review_closed", "This review is closed.", nil)
 	}
+	if record.ClaudeSessionID == "" {
+		return ReviewOutput{}, apperr.New("review_not_resumable", "Claude did not provide a session_id before this review stopped; start a new review.", map[string]any{"review_id": record.ReviewID, "status": record.Status})
+	}
 	if in.RepositoryPath != "" {
 		root, rootErr := s.Git.Root(ctx, in.RepositoryPath)
 		if rootErr != nil {
@@ -174,29 +204,38 @@ func (s *Service) ContinueReview(ctx context.Context, in ContinueReviewInput) (R
 	var untracked, excluded []string
 	var redactions int
 	if in.RefreshDiff {
-		diff, untracked, excluded, redactions, err = s.prepareDiff(ctx, record.RepositoryPath, record.BaseRef)
+		diff, untracked, excluded, redactions, err = s.prepareDiff(ctx, record.RepositoryPath, record.BaseRef, record.IncludePaths, record.ExcludePaths)
 		if err != nil {
 			return ReviewOutput{}, err
 		}
 	}
-	prompt := ContinuePrompt(in.Message, diff, in.TestResults, untracked, excluded, redactions)
+	prompt := ContinuePrompt(in.Message, diff, in.TestResults, record.IncludePaths, record.ExcludePaths, untracked, excluded, redactions, in.RefreshDiff)
 	if record.FallbackModel == "" {
 		record.FallbackModel = s.DefaultFallbackModel
 	}
 	if record.Effort == "" {
 		record.Effort = s.DefaultEffort
 	}
-	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID})
+	if in.TimeoutSeconds == 0 {
+		in.TimeoutSeconds = record.TimeoutSeconds
+	}
+	if err := s.resolveTimeout(&in.TimeoutSeconds); err != nil {
+		return ReviewOutput{}, err
+	}
+	result, err := s.Claude.Run(ctx, claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID, Timeout: time.Duration(in.TimeoutSeconds) * time.Second})
 	if err != nil {
-		return ReviewOutput{}, s.reviewFailure("continue_review", record.ReviewID, err)
+		return ReviewOutput{}, s.persistReviewFailure(ctx, "continue_review", &record, result.SessionID, err)
 	}
 	response, err := ParseResponse(result.StructuredOutput)
 	if err != nil {
-		return ReviewOutput{}, s.reviewFailure("continue_review", record.ReviewID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
+		return ReviewOutput{}, s.persistReviewFailure(ctx, "continue_review", &record, result.SessionID, apperr.Wrap("invalid_claude_output", "Claude returned an invalid structured response.", err, map[string]any{"stage": "response_schema_validation"}))
 	}
 	record.UpdatedAt = s.Now().UTC()
-	if err := s.Store.Update(ctx, record); err != nil {
-		return ReviewOutput{}, apperr.Wrap("storage_error", "Failed to update the review session.", err, nil)
+	record.Status = session.ReviewStatusOpen
+	record.LastErrorCode = ""
+	record.LastErrorAt = nil
+	if err := s.updateDetached(ctx, record); err != nil {
+		return ReviewOutput{}, s.completedPersistenceFailure("continue_review", record, true, err)
 	}
 	s.log("continue_review", record.ReviewID, started, len(diff), len(response.Findings))
 	return ReviewOutput{ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID, Response: response, ExcludedFiles: excluded, RedactionCount: redactions}, nil
@@ -211,8 +250,8 @@ func (s *Service) GetReview(ctx context.Context, id string) (session.ReviewSessi
 }
 
 func (s *Service) ListReviews(ctx context.Context, in ListReviewsInput) ([]session.ReviewSession, error) {
-	if in.Status != "" && in.Status != session.ReviewStatusOpen && in.Status != session.ReviewStatusClosed {
-		return nil, apperr.New("invalid_request", "The status filter must be open or closed.", nil)
+	if in.Status != "" && !validReviewStatus(in.Status) {
+		return nil, apperr.New("invalid_request", "The status filter must be pending, open, interrupted, failed, or closed.", nil)
 	}
 	var root string
 	if in.RepositoryPath != "" {
@@ -263,12 +302,13 @@ func (s *Service) CloseReview(ctx context.Context, in CloseReviewInput) (CloseOu
 	return CloseOutput{ReviewID: in.ReviewID, Status: string(r.Status)}, nil
 }
 
-func (s *Service) prepareDiff(ctx context.Context, root, base string) (string, []string, []string, int, error) {
-	diff, err := s.Git.Diff(ctx, root, base)
+func (s *Service) prepareDiff(ctx context.Context, root, base string, include, exclude []string) (string, []string, []string, int, error) {
+	scope := gitservice.PathScope{Include: include, Exclude: exclude}
+	diff, err := s.Git.Diff(ctx, root, base, scope)
 	if err != nil {
 		return "", nil, nil, 0, mapError(err)
 	}
-	untracked, err := s.Git.UntrackedFiles(ctx, root)
+	untracked, err := s.Git.UntrackedFiles(ctx, root, scope)
 	if err != nil {
 		return "", nil, nil, 0, mapError(err)
 	}
@@ -293,6 +333,8 @@ func mapError(err error) error {
 		return apperr.Wrap("invalid_repository", "The path does not point to a valid Git repository.", err, nil)
 	case errors.Is(err, gitservice.ErrInvalidBaseRef):
 		return apperr.Wrap("invalid_base_ref", "The Git base reference is invalid.", err, nil)
+	case errors.Is(err, gitservice.ErrInvalidPathScope):
+		return apperr.Wrap("invalid_path_scope", "include_paths and exclude_paths must contain safe repository-relative paths.", err, nil)
 	case errors.Is(err, gitservice.ErrDiffTooLarge):
 		return apperr.Wrap("diff_too_large", "The diff exceeds the configured limit; reduce the scope of the change.", err, nil)
 	case errors.Is(err, security.ErrPrivateKey):
@@ -300,7 +342,9 @@ func mapError(err error) error {
 	case errors.Is(err, claude.ErrMaxTurns):
 		return apperr.Wrap("claude_max_turns", "Claude reached max_turns before producing a structured review; increase max_turns or narrow the review scope.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrTimeout):
-		return apperr.Wrap("claude_timeout", "Claude did not respond before the timeout; increase timeout_seconds or narrow the review scope.", err, claudeFailureDetails(err, claude.StageProcessExit))
+		return apperr.Wrap("claude_timeout", "Claude did not respond before a timeout; narrow the review scope or ensure the MCP client deadline exceeds timeout_seconds.", err, claudeFailureDetails(err, claude.StageProcessExit))
+	case errors.Is(err, claude.ErrCanceled):
+		return apperr.Wrap("claude_canceled", "The enclosing MCP request was canceled before Claude completed; resume the review when a Claude session ID was captured.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrOutputTooLarge):
 		return apperr.Wrap("claude_output_too_large", "Claude output exceeds the configured limit.", err, claudeFailureDetails(err, claude.StageStreamParsing))
 	case errors.Is(err, claude.ErrSessionIDMissing):
@@ -342,6 +386,84 @@ func (s *Service) reviewFailure(tool, correlationID string, err error) error {
 		s.Logger.Error("review failed", "tool", tool, "correlation_id", correlationID, "error_code", appErr.Code, "details", details)
 	}
 	return appErr
+}
+
+func (s *Service) persistReviewFailure(ctx context.Context, tool string, record *session.ReviewSession, returnedSessionID string, err error) error {
+	mapped := s.reviewFailure(tool, record.ReviewID, err)
+	var appErr *apperr.Error
+	if !errors.As(mapped, &appErr) {
+		return mapped
+	}
+	if record.ClaudeSessionID == "" {
+		record.ClaudeSessionID = returnedSessionID
+	}
+	now := s.Now().UTC()
+	record.UpdatedAt = now
+	record.LastErrorCode = appErr.Code
+	record.LastErrorAt = &now
+	if record.ClaudeSessionID == "" {
+		record.Status = session.ReviewStatusFailed
+	} else {
+		record.Status = session.ReviewStatusInterrupted
+	}
+	details := make(map[string]any, len(appErr.Details)+4)
+	for key, value := range appErr.Details {
+		details[key] = value
+	}
+	details["review_id"] = record.ReviewID
+	details["resumable"] = record.ClaudeSessionID != ""
+	if record.ClaudeSessionID != "" {
+		details["claude_session_id"] = record.ClaudeSessionID
+	}
+	if persistErr := s.updateDetached(ctx, *record); persistErr != nil {
+		details["persistence_error"] = "failed to update the local review record"
+		if s.Logger != nil {
+			s.Logger.Error("failed to persist interrupted review", "review_id", record.ReviewID, "error", persistErr)
+		}
+	}
+	appErr.Details = details
+	return appErr
+}
+
+func (s *Service) updateDetached(ctx context.Context, record session.ReviewSession) error {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return s.Store.Update(persistCtx, record)
+}
+
+func (s *Service) completedPersistenceFailure(tool string, record session.ReviewSession, resumable bool, err error) error {
+	details := map[string]any{
+		"stage":             "session_persistence",
+		"review_id":         record.ReviewID,
+		"claude_session_id": record.ClaudeSessionID,
+		"resumable":         resumable,
+	}
+	if s.Logger != nil {
+		s.Logger.Error("completed review persistence failed", "tool", tool, "review_id", record.ReviewID, "claude_session_id", record.ClaudeSessionID, "error", err)
+	}
+	return apperr.Wrap("storage_error", "Claude completed, but the local review record could not be updated.", err, details)
+}
+
+func (s *Service) resolveTimeout(seconds *int) error {
+	if *seconds == 0 {
+		*seconds = s.DefaultTimeoutSeconds
+	}
+	if *seconds == 0 {
+		*seconds = 600
+	}
+	if *seconds < 1 || *seconds > 1200 {
+		return apperr.New("invalid_request", "timeout_seconds must be between 1 and 1200.", map[string]any{"timeout_seconds": *seconds})
+	}
+	return nil
+}
+
+func validReviewStatus(status session.ReviewStatus) bool {
+	switch status {
+	case session.ReviewStatusPending, session.ReviewStatusOpen, session.ReviewStatusInterrupted, session.ReviewStatusFailed, session.ReviewStatusClosed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) log(tool, reviewID string, start time.Time, diffBytes, findings int) {

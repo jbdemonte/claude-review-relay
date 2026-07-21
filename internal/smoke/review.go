@@ -50,7 +50,7 @@ func RunReview(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 		Logger: logger, CheckAuthentication: true,
 	}
 	store := session.NewJSONStore(filepath.Join(dir, "data", "sessions.json"))
-	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, logger)
+	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.TimeoutSeconds, logger)
 	_, err = service.ReviewDiff(ctx, reviewer.ReviewDiffInput{
 		RepositoryPath:    dir,
 		Goal:              "Verify the complete production review invocation against this isolated one-line Go diff.",

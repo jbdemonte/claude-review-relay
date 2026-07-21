@@ -20,16 +20,20 @@ For every non-trivial change:
 
 1. Implement the change.
 2. Run the relevant tests, linting, and type checking.
-3. Call `claude-reviewer.review_diff`.
+3. Call `claude-reviewer.review_diff` with literal `include_paths` for the files
+   under review, `max_turns: 20`, and `timeout_seconds: 240` for interactive
+   Codex sessions.
 4. Provide a precise goal and the test results.
 5. Analyze each finding instead of accepting it blindly.
 6. Fix confirmed critical-, high-, and medium-severity findings.
 7. Prepare a factual technical response for incorrect findings.
 8. Call `claude-reviewer.continue_review` with the same `review_id`.
 9. Ask Claude to verify the fixes and reassess previous findings.
-10. Stop after two complete cycles unless a critical issue remains.
-11. Do not treat Claude approval as a substitute for tests.
-12. Claude is a read-only reviewer; Codex remains the only agent that modifies the repository.
+10. Confirm that the continuation returns the same `claude_session_id`.
+11. Stop after two complete cycles unless a critical issue remains.
+12. Call `claude-reviewer.close_review` after the final accepted verdict.
+13. Do not treat Claude approval as a substitute for tests.
+14. Claude is a read-only reviewer; Codex remains the only agent that modifies the repository.
 
 ## 1. Think Before Coding
 

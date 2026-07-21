@@ -20,6 +20,7 @@ import (
 
 var (
 	ErrTimeout          = errors.New("claude process timed out")
+	ErrCanceled         = errors.New("claude process canceled")
 	ErrProcess          = errors.New("claude process failed")
 	ErrSessionIDMissing = errors.New("claude session id missing")
 	ErrInvalidOutput    = errors.New("invalid claude output")
@@ -52,6 +53,7 @@ type RunError struct {
 	EventCount      int
 	NumTurns        int
 	MaxTurns        int
+	TimeoutSeconds  int
 	Model           string
 	ArgumentNames   []string
 }
@@ -68,10 +70,11 @@ func (e *RunError) Unwrap() error { return e.Kind }
 
 func (e *RunError) PublicDetails() map[string]any {
 	details := map[string]any{
-		"stage":          e.Stage,
-		"event_count":    e.EventCount,
-		"max_turns":      e.MaxTurns,
-		"argument_names": append([]string(nil), e.ArgumentNames...),
+		"stage":           e.Stage,
+		"event_count":     e.EventCount,
+		"max_turns":       e.MaxTurns,
+		"timeout_seconds": e.TimeoutSeconds,
+		"argument_names":  append([]string(nil), e.ArgumentNames...),
 	}
 	if e.Model != "" {
 		details["model"] = e.Model
@@ -106,6 +109,7 @@ func (e *RunError) PublicDetails() map[string]any {
 type Request struct {
 	RepositoryPath, Prompt, SystemPrompt, Schema, Model, FallbackModel, Effort, SessionID string
 	MaxTurns                                                                              int
+	Timeout                                                                               time.Duration
 }
 
 type Client interface {
@@ -123,10 +127,15 @@ type CLIClient struct {
 }
 
 func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) {
-	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Minute
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = c.Timeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.Timeout)
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	req.Timeout = timeout
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	args := BuildArgs(req)
 	if c.CheckAuthentication {
@@ -179,6 +188,9 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return result, c.runError(req, args, result, ErrTimeout, StageProcessExit, ctx.Err(), exitCode, stderr.String())
 	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return result, c.runError(req, args, result, ErrCanceled, StageProcessExit, ctx.Err(), exitCode, stderr.String())
+	}
 	if errors.Is(parseErr, ErrOutputTooLarge) {
 		return result, c.runError(req, args, result, ErrOutputTooLarge, StageStreamParsing, parseErr, exitCode, stderr.String())
 	}
@@ -227,7 +239,8 @@ func (c *CLIClient) runError(req Request, args []string, result StreamResult, ki
 		StderrExcerpt: excerpt, TerminalSubtype: result.TerminalSubtype, TerminalIsError: result.TerminalIsError,
 		TerminalReason: result.TerminalReason, TerminalErrors: terminalErrors,
 		EventCount: result.EventCount, NumTurns: result.NumTurns, MaxTurns: req.MaxTurns,
-		Model: req.Model, ArgumentNames: ArgumentNames(args),
+		TimeoutSeconds: int((req.Timeout + time.Second - 1) / time.Second),
+		Model:          req.Model, ArgumentNames: ArgumentNames(args),
 	}
 	if c.Logger != nil {
 		c.Logger.Error("claude invocation failed",

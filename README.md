@@ -120,13 +120,30 @@ claude-reviewer serve
 
 `review_diff` requires at least `repository_path` and `goal`. `base_ref`
 defaults to `HEAD`, the primary model to `fable`, the fallback model to `opus`,
-the effort to `max`, and `max_turns` to 12. The result contains a new
-`review_id` and the persisted `claude_session_id`.
+the effort to `max`, `max_turns` to 12, and `timeout_seconds` to the configured
+default. `include_paths` and `exclude_paths` accept repository-relative files or
+directories and restrict both the tracked diff and the untracked-file list with
+literal Git pathspecs. The result contains a new `review_id` and the persisted
+`claude_session_id`.
+
+If the selected scope contains neither a tracked diff nor untracked files, the
+server returns `empty_review_scope` before starting Claude. This catches stale
+or misspelled paths without spending a review call. If files were present but
+all were excluded by the sensitive-content policy, the same error explicitly
+lists their names under `sensitive_excluded_files` without exposing contents.
 
 The `max` effort deliberately prioritizes review quality over cost and latency.
 Each call can choose a lower effort from `low`, `medium`, `high`, and `xhigh`.
 
-`continue_review` requires the same `review_id` and a new `message`. With
+Each call can set `timeout_seconds` from 1 through 1200. This limits the Claude
+subprocess; it cannot extend an earlier deadline imposed by the MCP client. If
+a Codex connector stops waiting after 300 seconds, setting 1200 does not make
+that synchronous MCP call wait for 20 minutes. For interactive calls, use a
+value below the connector deadline (for example, 240), a literal path scope,
+and lower effort only when latency matters more than maximum review quality.
+
+`continue_review` requires the same `review_id` and a new `message`, and can
+override `timeout_seconds` for that call. With
 `refresh_diff: true`, the server recomputes the diff and adds it only to the
 follow-up message. It reloads the association from disk and invokes exactly:
 
@@ -138,9 +155,21 @@ The conversational context therefore belongs to the native Claude session and
 survives restarts of the server, Codex, and the Mac.
 
 `get_review` does not contact Claude. `list_reviews` accepts `repository_path`
-and `status` filters. `close_review` closes the association; with
+and `status` filters. Statuses are `pending`, `open`, `interrupted`, `failed`,
+and `closed`. A failed initial call is recorded before Claude starts. If Claude
+reported a session ID before an interruption, the stored review is resumable
+with that exact session. A record without a Claude session ID is never resumed
+as a new conversation.
+
+An `approve` verdict intentionally leaves the review `open`, because approval
+may precede a correction-verification pass. Call `close_review` explicitly after
+the final accepted verdict. With
 `delete_claude_session: true`, V1 deletes only the local association, not native
 Claude Code data.
+
+When the MCP client supplies a progress token, long review calls emit an initial
+progress notification and a heartbeat every 15 seconds. These notifications
+improve visibility but are not guaranteed to reset a client-side deadline.
 
 ## Optional Configuration
 
@@ -153,7 +182,7 @@ Create `~/Library/Application Support/claude-reviewer/config.json`:
   "default_fallback_model": "opus",
   "default_effort": "max",
   "default_max_turns": 12,
-  "timeout_seconds": 600,
+  "timeout_seconds": 240,
   "max_diff_bytes": 2097152,
   "max_output_bytes": 8388608,
   "log_level": "info",
@@ -172,16 +201,18 @@ stack trace, prompt, or diff. Claude invocation failures include a correlation
 ID, failure stage, exit code when available, terminal reason, bounded redacted
 stderr, model, turn counts, and argument names without argument values. Codes
 include `invalid_repository`,
-`invalid_base_ref`, `review_not_found`, `review_closed`, `review_busy`,
+`invalid_base_ref`, `invalid_path_scope`, `review_not_found`, `review_closed`,
+`review_not_resumable`, `review_busy`, `empty_review_scope`,
 `repository_mismatch`, `claude_not_found`, `claude_not_authenticated`,
-`claude_timeout`, `claude_max_turns`, `claude_failed`, `claude_session_id_missing`,
+`claude_timeout`, `claude_canceled`, `claude_max_turns`, `claude_failed`, `claude_session_id_missing`,
 `invalid_claude_output`, `diff_too_large`, `claude_output_too_large`,
 `sensitive_content_detected`, and `storage_error`.
 
 `claude_max_turns` means Claude was still reviewing when it exhausted
 `max_turns`; retry with a larger value or a narrower scope. `claude_timeout`
-means the configured `timeout_seconds` elapsed and can require the same scope
-reduction or a larger configured timeout.
+means the subprocess or its enclosing MCP request deadline elapsed. Error
+details include `review_id`, `resumable`, and `claude_session_id` when one was
+observed before failure.
 
 ## V1 Limitations
 

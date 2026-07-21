@@ -155,7 +155,10 @@ Input:
   "additional_context": "Optional context",
   "test_results": "Optional results of tests already run",
   "model": "opus",
-  "max_turns": 12
+  "max_turns": 12,
+  "timeout_seconds": 240,
+  "include_paths": ["internal/reviewer", "README.md"],
+  "exclude_paths": ["internal/reviewer/testdata"]
 }
 ```
 
@@ -173,6 +176,14 @@ Rules:
   - untracked files must be reported separately;
   - never automatically send obviously secret files.
 - The response must contain the new `review_id`.
+- `include_paths` and `exclude_paths`, when provided, must be safe
+  repository-relative paths and must be applied by Git rather than only
+  described to Claude.
+- `timeout_seconds` may range from 1 through 1200 and limits the Claude
+  subprocess. It cannot extend a shorter deadline enforced by the MCP client.
+- Persist a `pending` review record before starting Claude. On failure, retain
+  it as `interrupted` when a Claude session ID was observed, otherwise as
+  `failed`.
 
 ### 4.2 `continue_review`
 
@@ -185,7 +196,8 @@ Input:
   "review_id": "review-uuid",
   "message": "I have fixed findings F001 and F003. Check the new diff.",
   "refresh_diff": true,
-  "test_results": "Optional new results"
+  "test_results": "Optional new results",
+  "timeout_seconds": 240
 }
 ```
 
@@ -197,6 +209,7 @@ Rules:
 - remind Claude that this is the continuation of the review, without repeating the entire initial prompt;
 - return a new structured response;
 - keep the same `review_id`.
+- never resume a record that has no explicit `claude_session_id`.
 
 ### 4.3 `get_review`
 
@@ -253,6 +266,10 @@ Input:
 ```
 
 For V1, there is no need to delete Claude Code's native data. It is enough to close or delete the local association, depending on the chosen option.
+
+Structured approval does not close a review automatically. This preserves the
+session for the required verification pass; the caller closes it explicitly
+after the final accepted verdict.
 
 ---
 
@@ -324,8 +341,10 @@ Do not use `--dangerously-skip-permissions`.
 
 ### Timeout and interruption
 
-- Default timeout for a Claude call: 10 minutes.
+- Default timeout for a Claude call: 4 minutes, leaving headroom below the
+  300-second deadline observed in Codex's MCP connector.
 - Timeout configurable in the configuration file.
+- A per-call timeout cannot extend an earlier client-side MCP deadline.
 - Use `exec.CommandContext`.
 - On MCP cancellation, interrupt the child process.
 - On macOS, ensure that descendant processes are not left orphaned.
@@ -616,9 +635,11 @@ Example:
 ```json
 {
   "claude_binary": "/opt/homebrew/bin/claude",
-  "default_model": "opus",
+  "default_model": "fable",
+  "default_fallback_model": "opus",
+  "default_effort": "max",
   "default_max_turns": 12,
-  "timeout_seconds": 600,
+  "timeout_seconds": 240,
   "max_diff_bytes": 2097152,
   "log_level": "info",
   "session_retention_days": 30
@@ -768,13 +789,17 @@ Define actionable errors:
 
 - `invalid_repository`
 - `invalid_base_ref`
+- `invalid_path_scope`
+- `empty_review_scope`
 - `review_not_found`
 - `review_closed`
+- `review_not_resumable`
 - `review_busy`
 - `repository_mismatch`
 - `claude_not_found`
 - `claude_not_authenticated`
 - `claude_timeout`
+- `claude_canceled`
 - `claude_max_turns`
 - `claude_failed`
 - `claude_session_id_missing`

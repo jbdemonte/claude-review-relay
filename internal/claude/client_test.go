@@ -104,6 +104,33 @@ func TestCLIClientProcessFailureAndTimeout(t *testing.T) {
 	}
 }
 
+func TestCLIClientUsesPerRequestTimeout(t *testing.T) {
+	dir := t.TempDir()
+	slow := writeScript(t, dir, "request-timeout", "#!/bin/sh\nsleep 5\n")
+	client := &CLIClient{Binary: slow, Timeout: time.Second, MaxOutputBytes: 4096}
+	started := time.Now()
+	_, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 1, Timeout: 30 * time.Millisecond})
+	var runErr *RunError
+	if !errors.Is(err, ErrTimeout) || !errors.As(err, &runErr) {
+		t.Fatalf("err=%v", err)
+	}
+	if runErr.TimeoutSeconds != 1 || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("timeout details=%+v elapsed=%v", runErr, time.Since(started))
+	}
+}
+
+func TestCLIClientClassifiesParentCancellation(t *testing.T) {
+	dir := t.TempDir()
+	slow := writeScript(t, dir, "canceled", "#!/bin/sh\nsleep 5\n")
+	client := &CLIClient{Binary: slow, Timeout: time.Second, MaxOutputBytes: 4096}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+	_, err := client.Run(ctx, Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 1})
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestCLIClientReportsMaxTurnsWithActionableDetails(t *testing.T) {
 	dir := t.TempDir()
 	script := `#!/bin/sh

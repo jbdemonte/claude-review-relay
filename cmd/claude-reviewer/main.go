@@ -83,7 +83,7 @@ func run() error {
 		client = &claude.CLIClient{Binary: binary, Timeout: cfg.Timeout(), MaxOutputBytes: cfg.MaxOutputBytes, Logger: logger, CheckAuthentication: true}
 	}
 	store := session.NewJSONStore(cfg.SessionsPath())
-	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, logger)
+	service := reviewer.NewService(store, gitservice.NewService(cfg.MaxDiffBytes), client, cfg.DefaultModel, cfg.DefaultFallbackModel, cfg.DefaultEffort, cfg.DefaultMaxTurns, cfg.TimeoutSeconds, logger)
 	server := mcpserver.New(service)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
