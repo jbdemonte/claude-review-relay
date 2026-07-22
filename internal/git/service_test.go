@@ -74,6 +74,30 @@ func TestServiceInvalidBaseRefAndLimit(t *testing.T) {
 	}
 }
 
+func TestResolveCommitPinsSymbolicReference(t *testing.T) {
+	repo := makeRepo(t)
+	service := NewService(1024 * 1024)
+	ctx := context.Background()
+	pinned, err := service.ResolveCommit(ctx, repo, "HEAD")
+	if err != nil || pinned == "" {
+		t.Fatalf("pinned=%q err=%v", pinned, err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "a.txt"}, {"commit", "-m", "change"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	diff, err := service.Diff(ctx, repo, pinned, PathScope{})
+	if err != nil || !strings.Contains(diff, "+two") {
+		t.Fatalf("diff=%q err=%v", diff, err)
+	}
+}
+
 func TestServiceRejectsNonRepository(t *testing.T) {
 	_, err := NewService(100).Root(context.Background(), t.TempDir())
 	if !errors.Is(err, ErrInvalidRepository) {

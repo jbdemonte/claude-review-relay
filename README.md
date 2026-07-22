@@ -168,6 +168,14 @@ server shuts down during a review, it cancels the Claude subprocess and stores
 the review as `interrupted` when a resumable Claude session ID was captured, or
 `failed` otherwise.
 
+When Claude rejects a request because its usage quota is exhausted, the server
+does not keep a process asleep until reset. It persists `waiting_for_quota`, the
+structured `retry_at` timestamp when Claude Code reports one, and the explicit
+Claude session ID when available. At or after that timestamp—or when capacity
+is available if no timestamp was reported—Codex calls `start_retry_review` with
+the same `review_id`. The retry uses `--resume` when a session exists; otherwise
+it replays the initial review under the same local review identity.
+
 Long reviews use background workers so the initial MCP call returns in a few
 seconds even when Claude needs several minutes. Polling reads the persisted
 state; it does not restart Claude or create a new conversation.
@@ -200,7 +208,7 @@ state; it does not restart Claude or create a new conversation.
 - Codex CLI or another MCP client with STDIO support.
 
 This guide and the production smoke test were validated with Claude Code
-2.1.216. `claude-reviewer doctor` checks the installed CLI's authentication and
+2.1.217. `claude-reviewer doctor` checks the installed CLI's authentication and
 required flags directly instead of relying only on a version number.
 
 ## Build and Test
@@ -244,7 +252,7 @@ args = ["serve"]
 ```
 
 Codex also supports optional per-tool approval overrides. To pre-approve the
-three tools that start or finalize review state, extend the server configuration
+tools that start or finalize review state, extend the server configuration
 with:
 
 ```toml
@@ -252,6 +260,9 @@ with:
 approval_mode = "approve"
 
 [mcp_servers.claude-reviewer.tools.start_continue_review]
+approval_mode = "approve"
+
+[mcp_servers.claude-reviewer.tools.start_retry_review]
 approval_mode = "approve"
 
 [mcp_servers.claude-reviewer.tools.close_review]
@@ -323,18 +334,26 @@ change in a project should follow the cross-review workflow automatically.
    `expected_response_sequence`, and `poll_after_seconds`.
 3. Poll `get_review_status` no more frequently than `poll_after_seconds` until
    `status` is no longer `pending`.
-4. Independently validate every finding. Claude is a reviewer, not an authority.
-5. Apply confirmed corrections and rerun the relevant tests.
-6. Call `start_continue_review` with the same `review_id`, a correction summary,
+4. If the status is `waiting_for_quota`, stop polling. Preserve the returned
+   `review_id`, `claude_session_id`, and `retry_at` when present. At or after
+   `retry_at`, or when capacity is available if it is absent, call
+   `start_retry_review` with the same `review_id` and a message that restates
+   the interrupted operation, then resume polling.
+5. Independently validate every finding. Claude is a reviewer, not an authority.
+6. Apply confirmed corrections and rerun the relevant tests.
+7. Call `start_continue_review` with the same `review_id`, a correction summary,
    and `refresh_diff: true`.
-7. Poll until the operation is no longer `pending`. Require the expected
+8. Poll until the operation is no longer `pending`. Require the expected
    response sequence and the same Claude session ID.
-8. Call `close_review` after accepting the final verdict.
+9. Call `close_review` after accepting the final verdict.
 
 Status meanings:
 
 - `pending`: a background operation is active;
 - `open`: a validated structured response is available;
+- `waiting_for_quota`: Claude rejected the operation for quota or rate limiting;
+  stop polling and retry the same review at `retry_at`, or when capacity is
+  available if `retry_at` is absent;
 - `interrupted`: the operation stopped and the explicit Claude session can be
   resumed;
 - `failed`: no resumable Claude session was captured;
@@ -387,19 +406,24 @@ For every non-trivial change:
 5. Provide a precise goal and the test results.
 6. Poll `claude-reviewer.get_review_status` no more frequently than the returned
    `poll_after_seconds` until the status is no longer `pending`.
-7. Analyze each finding instead of accepting it blindly.
-8. Fix confirmed critical-, high-, and medium-severity findings.
-9. Prepare a factual technical response for incorrect findings.
-10. Call `claude-reviewer.start_continue_review` with the same `review_id`,
+7. If the status is `waiting_for_quota`, stop polling and report `retry_at` when
+   present. At or after that time, or when capacity is available if it is
+   absent, call `claude-reviewer.start_retry_review` with the same `review_id`
+   and a message that restates the interrupted operation, then resume polling.
+   Do not create a replacement review.
+8. Analyze each finding instead of accepting it blindly.
+9. Fix confirmed critical-, high-, and medium-severity findings.
+10. Prepare a factual technical response for incorrect findings.
+11. Call `claude-reviewer.start_continue_review` with the same `review_id`,
    `refresh_diff: true`, and a request to verify the fixes.
-11. Poll until the status is no longer `pending`, then require the returned
+12. Poll until the status is no longer `pending`, then require the returned
     `expected_response_sequence`; report a terminal error instead of polling
     indefinitely if that sequence was not produced.
-12. Confirm that the continuation returns the same `claude_session_id`.
-13. Stop after two completed review cycles unless a critical issue remains.
-14. Call `claude-reviewer.close_review` after the final accepted verdict.
-15. Do not treat Claude approval as a substitute for tests.
-16. Claude is a read-only reviewer; Codex remains the only agent that modifies
+13. Confirm that the continuation returns the same `claude_session_id`.
+14. Stop after two completed review cycles unless a critical issue remains.
+15. Call `claude-reviewer.close_review` after the final accepted verdict.
+16. Do not treat Claude approval as a substitute for tests.
+17. Claude is a read-only reviewer; Codex remains the only agent that modifies
     the repository.
 ```
 
@@ -413,6 +437,7 @@ this block. The filename recognized by Codex is `AGENTS.md`.
 | `start_review`          | Validate, persist, and start a background review; return immediately  |
 | `get_review_status`     | Read the latest background status, structured response, or safe error |
 | `start_continue_review` | Resume the persisted explicit Claude session in a background worker   |
+| `start_retry_review`    | Retry a quota-blocked or interrupted retry with the same review ID    |
 | `review_diff`           | Synchronous compatibility form of the initial review                  |
 | `continue_review`       | Synchronous compatibility form of the continuation                    |
 | `get_review`            | Read persisted metadata without contacting Claude                     |
@@ -435,6 +460,16 @@ Session metadata is stored at:
 The native Claude conversation remains in Claude Code's own storage. This
 project stores the explicit association needed to resume it safely. Restarting
 Codex, the MCP server, or the Mac does not intentionally change that mapping.
+
+A quota retry always recomputes the current scoped diff. If Claude provided no
+session ID, the server rebuilds the initial request from the persisted goal,
+resolved base commit, review focus, and path scope. Quota retries and ordinary
+continuations both use that resolved commit, keeping the original range stable
+if a symbolic reference such as `HEAD` or `origin/main` moves. Supply updated
+`additional_context` and `test_results` to `start_retry_review` when those
+ephemeral inputs are still relevant; prompt bodies are not persisted locally.
+When retrying a continuation, `message` is required so the interrupted
+verification request is restated explicitly.
 
 An `approve` verdict leaves the review `open` so Codex can still request a
 correction-verification pass. `close_review` finalizes it explicitly.
@@ -477,10 +512,13 @@ Common codes include:
 - request and Git errors: `invalid_repository`, `invalid_base_ref`,
   `invalid_path_scope`, `empty_review_scope`, `diff_too_large`;
 - lifecycle errors: `review_not_found`, `review_closed`,
-  `review_not_resumable`, `review_busy`, `repository_mismatch`;
+  `review_not_resumable`, `review_not_waiting_for_quota`,
+  `review_waiting_for_quota`, `quota_retry_not_ready`, `review_busy`,
+  `repository_mismatch`;
 - Claude errors: `claude_not_found`, `claude_not_authenticated`,
-  `claude_timeout`, `claude_canceled`, `claude_max_turns`, `claude_failed`,
-  `claude_session_id_missing`, `invalid_claude_output`,
+  `claude_timeout`, `claude_canceled`, `claude_max_turns`,
+  `claude_quota_exceeded`, `claude_failed`, `claude_session_id_missing`,
+  `invalid_claude_output`,
   `claude_output_too_large`;
 - worker and storage errors: `storage_error`, `worker_failed`,
   `background_worker_stopped`, `server_shutting_down`;
@@ -489,6 +527,15 @@ Common codes include:
 When a failure captured a Claude session ID, details identify the review as
 resumable. Continue it with the same `review_id`; never create a replacement
 conversation and pretend that context was preserved.
+
+Quota rejection is different from an ordinary failure. Claude Code emits a
+structured `rate_limit_event`; the server records `claude_quota_exceeded`,
+`waiting_for_quota`, and `retry_at` plus `retry_after_seconds` when Claude
+reports a reset time. A bare HTTP 429 remains immediately retryable because no
+reset time is known. The server does not retry in a loop or depend on the STDIO
+process surviving until reset. Use `start_retry_review` after the reported time,
+or when capacity is available. `force_before_retry_at: true` is available only
+when quota became available early, such as after enabling additional usage.
 
 ## V1 Limitations
 
@@ -500,4 +547,6 @@ conversation and pretend that context was preserved.
   database, multi-Mac synchronization, or telemetry;
 - no automatic split for diffs larger than the configured limit;
 - no automatic review-record retention cleanup;
-- closing a review does not delete the native Claude Code conversation.
+- closing a review does not delete the native Claude Code conversation;
+- quota retries are persistent but not automatically scheduled; Codex or
+  another MCP client must call `start_retry_review` after `retry_at`.

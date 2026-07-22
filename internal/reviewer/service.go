@@ -65,6 +65,16 @@ type ContinueReviewInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Claude subprocess timeout in seconds, from 1 to 1200; cannot extend the MCP client's own deadline"`
 }
 
+type RetryReviewInput struct {
+	ReviewID           string `json:"review_id"`
+	Message            string `json:"message,omitempty"`
+	AdditionalContext  string `json:"additional_context,omitempty"`
+	TestResults        string `json:"test_results,omitempty"`
+	RepositoryPath     string `json:"repository_path,omitempty"`
+	TimeoutSeconds     int    `json:"timeout_seconds,omitempty" jsonschema:"Claude subprocess timeout in seconds, from 1 to 1200"`
+	ForceBeforeRetryAt bool   `json:"force_before_retry_at,omitempty" jsonschema:"retry before the quota reset timestamp; use only when quota became available early"`
+}
+
 type GetReviewInput struct {
 	ReviewID string `json:"review_id"`
 }
@@ -111,6 +121,8 @@ type ReviewStatusOutput struct {
 	RedactionCount   int                  `json:"redaction_count"`
 	LastErrorCode    string               `json:"last_error_code,omitempty"`
 	LastErrorDetails map[string]any       `json:"last_error_details,omitempty"`
+	RetryAt          *time.Time           `json:"retry_at,omitempty"`
+	RetryOperation   string               `json:"retry_operation,omitempty"`
 	CreatedAt        time.Time            `json:"created_at"`
 	UpdatedAt        time.Time            `json:"updated_at"`
 }
@@ -185,6 +197,10 @@ func (s *Service) prepareInitialReview(ctx context.Context, in ReviewDiffInput, 
 	if in.BaseRef == "" {
 		in.BaseRef = "HEAD"
 	}
+	baseSHA, err := s.Git.ResolveCommit(ctx, root, in.BaseRef)
+	if err != nil {
+		return nil, mapError(err)
+	}
 	diff, untracked, excluded, redactions, err := s.prepareDiff(ctx, root, in.BaseRef, in.IncludePaths, in.ExcludePaths)
 	if err != nil {
 		return nil, err
@@ -223,7 +239,7 @@ func (s *Service) prepareInitialReview(ctx context.Context, in ReviewDiffInput, 
 		return nil, err
 	}
 	now := s.Now().UTC()
-	record := session.ReviewSession{ReviewID: reviewID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, IncludePaths: append([]string(nil), in.IncludePaths...), ExcludePaths: append([]string(nil), in.ExcludePaths...), HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, TimeoutSeconds: in.TimeoutSeconds, Status: session.ReviewStatusPending, ActiveOperation: "initial", LastExcludedFiles: append([]string(nil), excluded...), LastRedactionCount: redactions, CreatedAt: now, UpdatedAt: now}
+	record := session.ReviewSession{ReviewID: reviewID, RepositoryPath: root, Goal: in.Goal, BaseRef: in.BaseRef, BaseSHAAtStart: baseSHA, IncludePaths: append([]string(nil), in.IncludePaths...), ExcludePaths: append([]string(nil), in.ExcludePaths...), HeadSHAAtStart: head, Model: in.Model, FallbackModel: in.FallbackModel, Effort: in.Effort, MaxTurns: in.MaxTurns, TimeoutSeconds: in.TimeoutSeconds, Status: session.ReviewStatusPending, ActiveOperation: "initial", ReviewFocus: append([]string(nil), in.ReviewFocus...), LastExcludedFiles: append([]string(nil), excluded...), LastRedactionCount: redactions, CreatedAt: now, UpdatedAt: now}
 	if err := s.Store.Create(ctx, record); err != nil {
 		return nil, apperr.Wrap("storage_error", "Failed to persist the pending review.", err, nil)
 	}
@@ -254,6 +270,8 @@ func (s *Service) executeReview(ctx context.Context, tool string, prepared *prep
 	prepared.record.LastErrorCode = ""
 	prepared.record.LastErrorDetails = nil
 	prepared.record.LastErrorAt = nil
+	prepared.record.RetryAt = nil
+	prepared.record.RetryOperation = ""
 	prepared.record.UpdatedAt = s.Now().UTC()
 	if err := s.updateDetached(ctx, prepared.record); err != nil {
 		return ReviewOutput{}, s.completedPersistenceFailure(tool, prepared.record, prepared.request.SessionID != "", err)
@@ -324,6 +342,133 @@ func (s *Service) StartContinueReview(ctx context.Context, in ContinueReviewInpu
 	return out, nil
 }
 
+func (s *Service) StartRetryReview(ctx context.Context, in RetryReviewInput) (AsyncStartOutput, error) {
+	if in.TimeoutSeconds == 0 {
+		in.TimeoutSeconds = s.AsyncTimeoutSeconds
+	}
+	prepared, err := s.prepareQuotaRetry(ctx, in, s.AsyncTimeoutSeconds)
+	if err != nil {
+		return AsyncStartOutput{}, err
+	}
+	out := AsyncStartOutput{ReviewID: prepared.record.ReviewID, ClaudeSessionID: prepared.record.ClaudeSessionID, Status: session.ReviewStatusPending, Operation: "quota_retry", ExpectedResponseSequence: prepared.record.ResponseSequence + 1, PollAfterSeconds: 15}
+	if err := s.launchReview("start_retry_review", prepared); err != nil {
+		return AsyncStartOutput{}, err
+	}
+	return out, nil
+}
+
+func (s *Service) prepareQuotaRetry(ctx context.Context, in RetryReviewInput, defaultTimeoutSeconds int) (*preparedReview, error) {
+	if in.ReviewID == "" {
+		return nil, apperr.New("invalid_request", "review_id is required.", nil)
+	}
+	unlock, ok := s.locks.try(in.ReviewID)
+	if !ok {
+		return nil, apperr.New("review_busy", "This review is already in use.", nil)
+	}
+	lease, err := session.AcquireReviewLease(s.Store.LeaseDir(), in.ReviewID)
+	if errors.Is(err, session.ErrLeaseBusy) {
+		unlock()
+		return nil, apperr.New("review_busy", "This review is already running in another MCP server process.", map[string]any{"review_id": in.ReviewID})
+	}
+	if err != nil {
+		unlock()
+		return nil, apperr.Wrap("storage_error", "Failed to acquire the review worker lease.", err, map[string]any{"review_id": in.ReviewID})
+	}
+	release := func() {
+		if err := lease.Release(); err != nil && s.Logger != nil {
+			s.Logger.Error("failed to release review lease", "review_id", in.ReviewID, "error", err)
+		}
+		unlock()
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			release()
+		}
+	}()
+	record, err := s.Store.Get(ctx, in.ReviewID)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	if record.Status == session.ReviewStatusClosed {
+		return nil, apperr.New("review_closed", "This review is closed.", nil)
+	}
+	retryingInterruptedAttempt := record.RetryOperation != "" && (record.Status == session.ReviewStatusInterrupted || record.Status == session.ReviewStatusFailed)
+	if record.Status != session.ReviewStatusWaiting && !retryingInterruptedAttempt {
+		return nil, apperr.New("review_not_waiting_for_quota", "Only a quota-blocked review or an interrupted quota retry can be retried with this tool.", map[string]any{"review_id": record.ReviewID, "status": record.Status})
+	}
+	now := s.Now().UTC()
+	if record.Status == session.ReviewStatusWaiting && record.RetryAt != nil && now.Before(*record.RetryAt) && !in.ForceBeforeRetryAt {
+		return nil, apperr.New("quota_retry_not_ready", "Claude's quota reset time has not been reached; retry at retry_at or explicitly force an early retry.", map[string]any{"review_id": record.ReviewID, "retry_at": record.RetryAt.UTC().Format(time.RFC3339), "retry_after_seconds": secondsUntil(now, *record.RetryAt)})
+	}
+	if in.RepositoryPath != "" {
+		root, rootErr := s.Git.Root(ctx, in.RepositoryPath)
+		if rootErr != nil {
+			return nil, mapError(rootErr)
+		}
+		if !samePath(root, record.RepositoryPath) {
+			return nil, apperr.New("repository_mismatch", "The requested repository does not match the review repository.", map[string]any{"expected": record.RepositoryPath, "actual": root})
+		}
+	}
+	retryBase := reviewBase(record)
+	diff, untracked, excluded, redactions, err := s.prepareDiff(ctx, record.RepositoryPath, retryBase, record.IncludePaths, record.ExcludePaths)
+	if err != nil {
+		return nil, err
+	}
+	if record.ClaudeSessionID == "" && diff == "" && len(untracked) == 0 {
+		return nil, apperr.New("empty_review_scope", "The selected path scope contains no tracked diff or untracked files.", map[string]any{"include_paths": record.IncludePaths, "exclude_paths": record.ExcludePaths})
+	}
+	if record.Model == "" {
+		record.Model = s.DefaultModel
+	}
+	if record.FallbackModel == "" {
+		record.FallbackModel = s.DefaultFallbackModel
+	}
+	if record.Effort == "" {
+		record.Effort = s.DefaultEffort
+	}
+	if record.MaxTurns <= 0 {
+		record.MaxTurns = s.DefaultMaxTurns
+	}
+	if err := s.resolveTimeoutWithDefault(&in.TimeoutSeconds, defaultTimeoutSeconds); err != nil {
+		return nil, err
+	}
+	if record.RetryOperation == "continuation" && in.Message == "" {
+		return nil, apperr.New("invalid_request", "message is required when retrying a quota-blocked continuation so the verification request is restated explicitly.", map[string]any{"review_id": record.ReviewID})
+	}
+	message := in.Message
+	if message == "" {
+		message = "The previous Claude request was rejected because the usage quota was exhausted. Perform the requested review now."
+	}
+	if in.AdditionalContext != "" {
+		message += "\n\nADDITIONAL CONTEXT\n" + in.AdditionalContext
+	}
+	prompt := ContinuePrompt(message, diff, in.TestResults, record.IncludePaths, record.ExcludePaths, untracked, excluded, redactions, true)
+	systemPrompt := ""
+	if record.ClaudeSessionID == "" {
+		focus := record.ReviewFocus
+		if len(focus) == 0 {
+			focus = []string{"correctness", "regressions", "architecture", "performance", "security", "tests"}
+		}
+		prompt = InitialPrompt(InitialPromptInput{Goal: record.Goal, BaseRef: retryBase, Diff: diff, AdditionalContext: in.AdditionalContext, TestResults: in.TestResults, ReviewFocus: focus, IncludePaths: record.IncludePaths, ExcludePaths: record.ExcludePaths, UntrackedFiles: untracked, ExcludedFiles: excluded, RedactionCount: redactions})
+		systemPrompt = SystemPrompt
+	}
+	record.Status = session.ReviewStatusPending
+	record.ActiveOperation = "quota_retry"
+	record.UpdatedAt = now
+	record.LastErrorCode = ""
+	record.LastErrorDetails = nil
+	record.LastErrorAt = nil
+	record.LastExcludedFiles = append([]string(nil), excluded...)
+	record.LastRedactionCount = redactions
+	if err := s.updateDetached(ctx, record); err != nil {
+		return nil, apperr.Wrap("storage_error", "Failed to mark the quota retry as pending.", err, map[string]any{"review_id": record.ReviewID})
+	}
+	keepLock = true
+	request := claude.Request{RepositoryPath: record.RepositoryPath, Prompt: prompt, SystemPrompt: systemPrompt, Schema: ResponseSchema, Model: record.Model, FallbackModel: record.FallbackModel, Effort: record.Effort, MaxTurns: record.MaxTurns, SessionID: record.ClaudeSessionID, Timeout: time.Duration(in.TimeoutSeconds) * time.Second}
+	return &preparedReview{record: record, request: request, excludedFiles: excluded, redactionCount: redactions, diffBytes: len(diff), release: release}, nil
+}
+
 func (s *Service) prepareContinuation(ctx context.Context, in ContinueReviewInput, defaultTimeoutSeconds int) (*preparedReview, error) {
 	if in.ReviewID == "" || in.Message == "" {
 		return nil, apperr.New("invalid_request", "review_id and message are required.", nil)
@@ -360,6 +505,9 @@ func (s *Service) prepareContinuation(ctx context.Context, in ContinueReviewInpu
 	if record.Status == session.ReviewStatusClosed {
 		return nil, apperr.New("review_closed", "This review is closed.", nil)
 	}
+	if record.Status == session.ReviewStatusWaiting {
+		return nil, quotaWaitError(record, s.Now().UTC())
+	}
 	if record.ClaudeSessionID == "" {
 		return nil, apperr.New("review_not_resumable", "Claude did not provide a session_id before this review stopped; start a new review.", map[string]any{"review_id": record.ReviewID, "status": record.Status})
 	}
@@ -376,7 +524,7 @@ func (s *Service) prepareContinuation(ctx context.Context, in ContinueReviewInpu
 	var untracked, excluded []string
 	var redactions int
 	if in.RefreshDiff {
-		diff, untracked, excluded, redactions, err = s.prepareDiff(ctx, record.RepositoryPath, record.BaseRef, record.IncludePaths, record.ExcludePaths)
+		diff, untracked, excluded, redactions, err = s.prepareDiff(ctx, record.RepositoryPath, reviewBase(record), record.IncludePaths, record.ExcludePaths)
 		if err != nil {
 			return nil, err
 		}
@@ -400,6 +548,8 @@ func (s *Service) prepareContinuation(ctx context.Context, in ContinueReviewInpu
 	record.LastErrorCode = ""
 	record.LastErrorDetails = nil
 	record.LastErrorAt = nil
+	record.RetryAt = nil
+	record.RetryOperation = ""
 	if in.RefreshDiff {
 		record.LastExcludedFiles = append([]string(nil), excluded...)
 		record.LastRedactionCount = redactions
@@ -427,7 +577,7 @@ func (s *Service) GetReviewStatus(ctx context.Context, id string) (ReviewStatusO
 	if record.Status == session.ReviewStatusPending {
 		lease, leaseErr := session.AcquireReviewLease(s.Store.LeaseDir(), record.ReviewID)
 		if errors.Is(leaseErr, session.ErrLeaseBusy) {
-			return statusOutput(record)
+			return s.statusOutput(record)
 		}
 		if leaseErr != nil {
 			return ReviewStatusOutput{}, apperr.Wrap("storage_error", "Failed to inspect the review worker lease.", leaseErr, map[string]any{"review_id": record.ReviewID})
@@ -441,7 +591,7 @@ func (s *Service) GetReviewStatus(ctx context.Context, id string) (ReviewStatusO
 			s.markStoppedWorker(&record)
 		}
 	}
-	return statusOutput(record)
+	return s.statusOutput(record)
 }
 
 func (s *Service) RecoverStaleWorkers(ctx context.Context) error {
@@ -487,12 +637,17 @@ func (s *Service) RecoverStaleWorkers(ctx context.Context) error {
 }
 
 func (s *Service) markStoppedWorker(record *session.ReviewSession) {
+	activeOperation := record.ActiveOperation
 	now := s.Now().UTC()
 	record.ActiveOperation = ""
 	record.UpdatedAt = now
 	record.LastErrorCode = "background_worker_stopped"
 	record.LastErrorAt = &now
 	record.LastErrorDetails = map[string]any{"stage": "background_worker", "review_id": record.ReviewID, "resumable": record.ClaudeSessionID != ""}
+	if activeOperation == "quota_retry" && record.RetryOperation != "" {
+		record.LastErrorDetails["retryable"] = true
+		record.LastErrorDetails["retry_operation"] = record.RetryOperation
+	}
 	if record.ClaudeSessionID == "" {
 		record.Status = session.ReviewStatusFailed
 	} else {
@@ -500,13 +655,21 @@ func (s *Service) markStoppedWorker(record *session.ReviewSession) {
 	}
 }
 
-func statusOutput(record session.ReviewSession) (ReviewStatusOutput, error) {
+func (s *Service) statusOutput(record session.ReviewSession) (ReviewStatusOutput, error) {
+	details := cloneDetails(record.LastErrorDetails)
+	if record.Status == session.ReviewStatusWaiting && record.RetryAt != nil {
+		if details == nil {
+			details = map[string]any{}
+		}
+		details["retry_after_seconds"] = secondsUntil(s.Now().UTC(), *record.RetryAt)
+	}
 	output := ReviewStatusOutput{
 		ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID,
 		Status: record.Status, ActiveOperation: record.ActiveOperation,
 		ResponseSequence: record.ResponseSequence,
 		ExcludedFiles:    append([]string(nil), record.LastExcludedFiles...), RedactionCount: record.LastRedactionCount,
-		LastErrorCode: record.LastErrorCode, LastErrorDetails: cloneDetails(record.LastErrorDetails),
+		LastErrorCode: record.LastErrorCode, LastErrorDetails: details,
+		RetryAt: cloneTime(record.RetryAt), RetryOperation: record.RetryOperation,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 	if len(record.LastResponse) > 0 {
@@ -521,7 +684,7 @@ func statusOutput(record session.ReviewSession) (ReviewStatusOutput, error) {
 
 func (s *Service) ListReviews(ctx context.Context, in ListReviewsInput) ([]session.ReviewSession, error) {
 	if in.Status != "" && !validReviewStatus(in.Status) {
-		return nil, apperr.New("invalid_request", "The status filter must be pending, open, interrupted, failed, or closed.", nil)
+		return nil, apperr.New("invalid_request", "The status filter must be pending, open, waiting_for_quota, interrupted, failed, or closed.", nil)
 	}
 	var root string
 	if in.RepositoryPath != "" {
@@ -620,6 +783,8 @@ func mapError(err error) error {
 		return apperr.Wrap("diff_too_large", "The diff exceeds the configured limit; reduce the scope of the change.", err, nil)
 	case errors.Is(err, security.ErrPrivateKey):
 		return apperr.New("sensitive_content_detected", "A complete private key was detected; the review was rejected.", nil)
+	case errors.Is(err, claude.ErrQuotaExceeded):
+		return apperr.Wrap("claude_quota_exceeded", "Claude rejected the request because of a quota or rate limit; retry at retry_at when provided, otherwise retry when capacity is available.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrMaxTurns):
 		return apperr.Wrap("claude_max_turns", "Claude reached max_turns before producing a structured review; increase max_turns or narrow the review scope.", err, claudeFailureDetails(err, claude.StageProcessExit))
 	case errors.Is(err, claude.ErrTimeout):
@@ -678,16 +843,12 @@ func (s *Service) persistReviewFailure(ctx context.Context, tool string, record 
 	if record.ClaudeSessionID == "" {
 		record.ClaudeSessionID = returnedSessionID
 	}
+	activeOperation := record.ActiveOperation
 	now := s.Now().UTC()
 	record.UpdatedAt = now
 	record.ActiveOperation = ""
 	record.LastErrorCode = appErr.Code
 	record.LastErrorAt = &now
-	if record.ClaudeSessionID == "" {
-		record.Status = session.ReviewStatusFailed
-	} else {
-		record.Status = session.ReviewStatusInterrupted
-	}
 	details := make(map[string]any, len(appErr.Details)+4)
 	for key, value := range appErr.Details {
 		details[key] = value
@@ -696,6 +857,37 @@ func (s *Service) persistReviewFailure(ctx context.Context, tool string, record 
 	details["resumable"] = record.ClaudeSessionID != ""
 	if record.ClaudeSessionID != "" {
 		details["claude_session_id"] = record.ClaudeSessionID
+	}
+	if appErr.Code == "claude_quota_exceeded" {
+		record.Status = session.ReviewStatusWaiting
+		if activeOperation != "quota_retry" || record.RetryOperation == "" {
+			record.RetryOperation = activeOperation
+		}
+		record.RetryAt = retryTime(appErr.Details)
+		details["retry_operation"] = record.RetryOperation
+		details["retryable"] = true
+		if record.RetryAt != nil {
+			details["retry_at"] = record.RetryAt.UTC().Format(time.RFC3339)
+			details["retry_after_seconds"] = secondsUntil(now, *record.RetryAt)
+		}
+	} else if record.ClaudeSessionID == "" {
+		record.Status = session.ReviewStatusFailed
+		if activeOperation != "quota_retry" {
+			record.RetryAt = nil
+			record.RetryOperation = ""
+		} else {
+			details["retryable"] = true
+			details["retry_operation"] = record.RetryOperation
+		}
+	} else {
+		record.Status = session.ReviewStatusInterrupted
+		if activeOperation != "quota_retry" {
+			record.RetryAt = nil
+			record.RetryOperation = ""
+		} else {
+			details["retryable"] = true
+			details["retry_operation"] = record.RetryOperation
+		}
 	}
 	appErr.Details = details
 	record.LastErrorDetails = cloneDetails(details)
@@ -761,9 +953,45 @@ func cloneDetails(details map[string]any) map[string]any {
 	return cloned
 }
 
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func retryTime(details map[string]any) *time.Time {
+	value, _ := details["retry_at"].(string)
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func secondsUntil(now, retryAt time.Time) int {
+	remaining := retryAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	return int((remaining + time.Second - 1) / time.Second)
+}
+
+func quotaWaitError(record session.ReviewSession, now time.Time) error {
+	details := map[string]any{"review_id": record.ReviewID, "retryable": true, "resumable": record.ClaudeSessionID != ""}
+	message := "This review is waiting for Claude capacity; use start_retry_review when capacity is available."
+	if record.RetryAt != nil {
+		details["retry_at"] = record.RetryAt.UTC().Format(time.RFC3339)
+		details["retry_after_seconds"] = secondsUntil(now, *record.RetryAt)
+		message = "This review is waiting for Claude quota; use start_retry_review after retry_at."
+	}
+	return apperr.New("review_waiting_for_quota", message, details)
+}
+
 func validReviewStatus(status session.ReviewStatus) bool {
 	switch status {
-	case session.ReviewStatusPending, session.ReviewStatusOpen, session.ReviewStatusInterrupted, session.ReviewStatusFailed, session.ReviewStatusClosed:
+	case session.ReviewStatusPending, session.ReviewStatusOpen, session.ReviewStatusWaiting, session.ReviewStatusInterrupted, session.ReviewStatusFailed, session.ReviewStatusClosed:
 		return true
 	default:
 		return false
@@ -780,6 +1008,13 @@ func samePath(a, b string) bool {
 	aa, _ := filepath.Abs(a)
 	bb, _ := filepath.Abs(b)
 	return filepath.Clean(aa) == filepath.Clean(bb)
+}
+
+func reviewBase(record session.ReviewSession) string {
+	if record.BaseSHAAtStart != "" {
+		return record.BaseSHAAtStart
+	}
+	return record.BaseRef
 }
 
 type sessionLocks struct {

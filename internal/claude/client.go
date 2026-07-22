@@ -28,6 +28,7 @@ var (
 	ErrNotAuthenticated = errors.New("claude is not authenticated")
 	ErrOutputTooLarge   = errors.New("claude output exceeded configured limit")
 	ErrMaxTurns         = errors.New("claude reached the maximum number of turns")
+	ErrQuotaExceeded    = errors.New("claude usage quota exceeded")
 )
 
 const (
@@ -56,6 +57,9 @@ type RunError struct {
 	TimeoutSeconds  int
 	Model           string
 	ArgumentNames   []string
+	RetryAt         *time.Time
+	RateLimitType   string
+	APIErrorStatus  int
 }
 
 func (e *RunError) Error() string {
@@ -102,6 +106,17 @@ func (e *RunError) PublicDetails() map[string]any {
 	}
 	if e.NumTurns > 0 {
 		details["num_turns"] = e.NumTurns
+	}
+	if errors.Is(e.Kind, ErrQuotaExceeded) {
+		if e.RetryAt != nil {
+			details["retry_at"] = e.RetryAt.UTC().Format(time.RFC3339)
+		}
+		if e.RateLimitType != "" {
+			details["rate_limit_type"] = e.RateLimitType
+		}
+	}
+	if e.APIErrorStatus != 0 {
+		details["api_error_status"] = e.APIErrorStatus
 	}
 	return details
 }
@@ -197,6 +212,10 @@ func (c *CLIClient) Run(ctx context.Context, req Request) (StreamResult, error) 
 	if parseErr != nil {
 		return result, c.runError(req, args, result, ErrInvalidOutput, StageStreamParsing, parseErr, exitCode, stderr.String())
 	}
+	quotaRejected := result.RateLimitStatus == "rejected" || result.APIErrorStatus == 429
+	if quotaRejected && (result.TerminalIsError || len(result.StructuredOutput) == 0) {
+		return result, c.runError(req, args, result, ErrQuotaExceeded, StageProcessExit, waitErr, exitCode, stderr.String())
+	}
 	terminalMaxTurns := result.TerminalReason == "max_turns" || result.TerminalSubtype == "error_max_turns"
 	if terminalMaxTurns && (result.TerminalIsError || len(result.StructuredOutput) == 0) {
 		return result, c.runError(req, args, result, ErrMaxTurns, StageProcessExit, waitErr, exitCode, stderr.String())
@@ -240,7 +259,11 @@ func (c *CLIClient) runError(req Request, args []string, result StreamResult, ki
 		TerminalReason: result.TerminalReason, TerminalErrors: terminalErrors,
 		EventCount: result.EventCount, NumTurns: result.NumTurns, MaxTurns: req.MaxTurns,
 		TimeoutSeconds: int((req.Timeout + time.Second - 1) / time.Second),
-		Model:          req.Model, ArgumentNames: ArgumentNames(args),
+		Model:          req.Model, ArgumentNames: ArgumentNames(args), APIErrorStatus: result.APIErrorStatus,
+	}
+	if errors.Is(kind, ErrQuotaExceeded) {
+		err.RetryAt = result.RateLimitResetAt
+		err.RateLimitType = result.RateLimitType
 	}
 	if c.Logger != nil {
 		c.Logger.Error("claude invocation failed",
@@ -256,6 +279,9 @@ func (c *CLIClient) runError(req Request, args []string, result StreamResult, ki
 			"num_turns", err.NumTurns,
 			"max_turns", err.MaxTurns,
 			"model", err.Model,
+			"retry_at", err.RetryAt,
+			"rate_limit_type", err.RateLimitType,
+			"api_error_status", err.APIErrorStatus,
 			"argument_names", err.ArgumentNames,
 		)
 	}

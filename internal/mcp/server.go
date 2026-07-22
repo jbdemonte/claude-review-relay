@@ -13,7 +13,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 type Server struct{ sdk *mcpsdk.Server }
 
@@ -23,6 +23,7 @@ type reviewMetadata struct {
 	RepositoryPath    string               `json:"repository_path"`
 	Goal              string               `json:"goal"`
 	BaseRef           string               `json:"base_ref"`
+	BaseSHAAtStart    string               `json:"base_sha_at_start,omitempty"`
 	IncludePaths      []string             `json:"include_paths,omitempty"`
 	ExcludePaths      []string             `json:"exclude_paths,omitempty"`
 	HeadSHAAtStart    string               `json:"head_sha_at_start"`
@@ -39,6 +40,8 @@ type reviewMetadata struct {
 	RedactionCount    int                  `json:"redaction_count"`
 	CreatedAt         time.Time            `json:"created_at"`
 	UpdatedAt         time.Time            `json:"updated_at"`
+	RetryAt           *time.Time           `json:"retry_at,omitempty"`
+	RetryOperation    string               `json:"retry_operation,omitempty"`
 }
 
 type reviewsOutput struct {
@@ -46,7 +49,7 @@ type reviewsOutput struct {
 }
 
 func New(service *reviewer.Service) *Server {
-	sdk := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "claude-reviewer", Title: "Claude Reviewer", Version: Version}, &mcpsdk.ServerOptions{Instructions: "Independent read-only code review through persistent Claude Code sessions."})
+	sdk := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "claude-reviewer", Title: "Claude Review Relay", Version: Version}, &mcpsdk.ServerOptions{Instructions: "Independent read-only code review through persistent Claude Code sessions."})
 	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "review_diff", Description: "Start a new independent review of the server-computed Git diff and persist its Claude session.", Annotations: mutatingAnnotations("Start Claude review", false, true)}, func(ctx context.Context, req *mcpsdk.CallToolRequest, in reviewer.ReviewDiffInput) (*mcpsdk.CallToolResult, reviewer.ReviewOutput, error) {
 		stopProgress := startProgress(ctx, req, "Claude review")
 		defer stopProgress()
@@ -65,6 +68,10 @@ func New(service *reviewer.Service) *Server {
 	})
 	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "start_continue_review", Description: "Resume the persisted explicit Claude session in the background and return immediately.", Annotations: mutatingAnnotations("Start background Claude continuation", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.ContinueReviewInput) (*mcpsdk.CallToolResult, reviewer.AsyncStartOutput, error) {
 		out, err := service.StartContinueReview(ctx, in)
+		return nil, out, safeError(err)
+	})
+	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "start_retry_review", Description: "Retry a persisted review after Claude quota reset, resuming the same explicit session when available.", Annotations: mutatingAnnotations("Retry Claude review after quota reset", false, true)}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.RetryReviewInput) (*mcpsdk.CallToolResult, reviewer.AsyncStartOutput, error) {
+		out, err := service.StartRetryReview(ctx, in)
 		return nil, out, safeError(err)
 	})
 	mcpsdk.AddTool(sdk, &mcpsdk.Tool{Name: "get_review_status", Description: "Poll a background review and return its persisted status, latest structured response, or actionable error.", Annotations: readOnlyAnnotations("Get background review status")}, func(ctx context.Context, _ *mcpsdk.CallToolRequest, in reviewer.GetReviewInput) (*mcpsdk.CallToolResult, reviewer.ReviewStatusOutput, error) {
@@ -93,14 +100,23 @@ func New(service *reviewer.Service) *Server {
 func metadata(record session.ReviewSession) reviewMetadata {
 	return reviewMetadata{
 		ReviewID: record.ReviewID, ClaudeSessionID: record.ClaudeSessionID,
-		RepositoryPath: record.RepositoryPath, Goal: record.Goal, BaseRef: record.BaseRef,
+		RepositoryPath: record.RepositoryPath, Goal: record.Goal, BaseRef: record.BaseRef, BaseSHAAtStart: record.BaseSHAAtStart,
 		IncludePaths: append([]string(nil), record.IncludePaths...), ExcludePaths: append([]string(nil), record.ExcludePaths...),
 		HeadSHAAtStart: record.HeadSHAAtStart, Model: record.Model, FallbackModel: record.FallbackModel,
 		Effort: record.Effort, MaxTurns: record.MaxTurns, TimeoutSeconds: record.TimeoutSeconds,
 		Status: record.Status, ActiveOperation: record.ActiveOperation, ResponseSequence: record.ResponseSequence,
 		LastErrorCode: record.LastErrorCode, LastExcludedFiles: append([]string(nil), record.LastExcludedFiles...),
 		RedactionCount: record.LastRedactionCount, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+		RetryAt: cloneTime(record.RetryAt), RetryOperation: record.RetryOperation,
 	}
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func readOnlyAnnotations(title string) *mcpsdk.ToolAnnotations {

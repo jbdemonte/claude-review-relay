@@ -61,9 +61,18 @@ func TestReviewDiffSchemaExposesTimeoutAndLiteralPathScope(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"review_diff", "start_review", "start_continue_review", "get_review_status"} {
+	for _, name := range []string{"review_diff", "start_review", "start_continue_review", "start_retry_review", "get_review_status"} {
 		if found[name] == nil {
 			t.Fatalf("tool %s not found", name)
+		}
+	}
+	retrySchema, err := json.Marshal(found["start_retry_review"].InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"review_id", "timeout_seconds", "force_before_retry_at"} {
+		if !strings.Contains(string(retrySchema), `"`+name+`"`) {
+			t.Fatalf("start_retry_review schema does not contain %s: %s", name, retrySchema)
 		}
 	}
 	if found["get_review_status"].Annotations == nil || !found["get_review_status"].Annotations.ReadOnlyHint {
@@ -86,9 +95,10 @@ func TestMetadataAndStatusToolsRoundTripThroughMCP(t *testing.T) {
 	ctx := context.Background()
 	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
 	now := time.Now().UTC()
+	retryAt := now.Add(time.Hour)
 	record := session.ReviewSession{
 		ReviewID: "R", ClaudeSessionID: "A", RepositoryPath: "/repo", Goal: "test", BaseRef: "HEAD",
-		Status: session.ReviewStatusOpen, ResponseSequence: 1,
+		Status: session.ReviewStatusWaiting, ResponseSequence: 1, RetryAt: &retryAt, RetryOperation: "continuation",
 		LastResponse:     json.RawMessage(`{"verdict":"approve","summary":"ok","findings":[],"missing_tests":[]}`),
 		LastErrorDetails: map[string]any{"internal": "must only appear in status"}, CreatedAt: now, UpdatedAt: now,
 	}
@@ -120,6 +130,9 @@ func TestMetadataAndStatusToolsRoundTripThroughMCP(t *testing.T) {
 	if strings.Contains(string(getJSON), "last_response") || strings.Contains(string(getJSON), "last_error_details") {
 		t.Fatalf("get_review leaked internal payload: %s", getJSON)
 	}
+	if !strings.Contains(string(getJSON), `"retry_operation":"continuation"`) || !strings.Contains(string(getJSON), `"retry_at":`) {
+		t.Fatalf("get_review omitted retry metadata: %s", getJSON)
+	}
 
 	listResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{Name: "list_reviews", Arguments: map[string]any{}})
 	if err != nil || listResult.IsError {
@@ -132,6 +145,9 @@ func TestMetadataAndStatusToolsRoundTripThroughMCP(t *testing.T) {
 	if strings.Contains(string(listJSON), "last_response") || strings.Contains(string(listJSON), "last_error_details") {
 		t.Fatalf("list_reviews leaked internal payload: %s", listJSON)
 	}
+	if !strings.Contains(string(listJSON), `"retry_operation":"continuation"`) || !strings.Contains(string(listJSON), `"retry_at":`) {
+		t.Fatalf("list_reviews omitted retry metadata: %s", listJSON)
+	}
 
 	statusResult, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{Name: "get_review_status", Arguments: map[string]any{"review_id": "R"}})
 	if err != nil || statusResult.IsError {
@@ -141,7 +157,7 @@ func TestMetadataAndStatusToolsRoundTripThroughMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(statusJSON), `"response_sequence":1`) || !strings.Contains(string(statusJSON), `"verdict":"approve"`) {
+	if !strings.Contains(string(statusJSON), `"response_sequence":1`) || !strings.Contains(string(statusJSON), `"verdict":"approve"`) || !strings.Contains(string(statusJSON), `"retry_operation":"continuation"`) || !strings.Contains(string(statusJSON), `"retry_at":`) {
 		t.Fatalf("status payload=%s", statusJSON)
 	}
 }

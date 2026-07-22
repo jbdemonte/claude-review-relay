@@ -15,7 +15,8 @@ import (
 func TestJSONStorePersistsAcrossInstances(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data", "sessions.json")
 	now := time.Now().UTC().Round(time.Second)
-	want := ReviewSession{ReviewID: "R", ClaudeSessionID: "A", RepositoryPath: "/repo", Status: ReviewStatusOpen, ResponseSequence: 1, LastResponse: json.RawMessage(`{"verdict":"approve"}`), LastErrorDetails: map[string]any{"resumable": true}, CreatedAt: now, UpdatedAt: now}
+	retryAt := now.Add(time.Hour)
+	want := ReviewSession{ReviewID: "R", ClaudeSessionID: "A", RepositoryPath: "/repo", Status: ReviewStatusWaiting, ResponseSequence: 1, LastResponse: json.RawMessage(`{"verdict":"approve"}`), LastErrorDetails: map[string]any{"resumable": true}, RetryAt: &retryAt, RetryOperation: "continuation", CreatedAt: now, UpdatedAt: now}
 	if err := NewJSONStore(path).Create(context.Background(), want); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +28,7 @@ func TestJSONStorePersistsAcrossInstances(t *testing.T) {
 	if err := json.Unmarshal(got.LastResponse, &response); err != nil {
 		t.Fatal(err)
 	}
-	if got.ClaudeSessionID != "A" || got.ResponseSequence != 1 || response["verdict"] != "approve" || got.LastErrorDetails["resumable"] != true || !got.CreatedAt.Equal(now) {
+	if got.ClaudeSessionID != "A" || got.Status != ReviewStatusWaiting || got.ResponseSequence != 1 || response["verdict"] != "approve" || got.LastErrorDetails["resumable"] != true || got.RetryAt == nil || !got.RetryAt.Equal(retryAt) || got.RetryOperation != "continuation" || !got.CreatedAt.Equal(now) {
 		t.Fatalf("got %#v", got)
 	}
 	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {

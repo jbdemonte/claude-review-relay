@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 )
 
 type StreamResult struct {
@@ -18,6 +19,10 @@ type StreamResult struct {
 	TerminalErrors   []string
 	TerminalIsError  bool
 	NumTurns         int
+	APIErrorStatus   int
+	RateLimitStatus  string
+	RateLimitType    string
+	RateLimitResetAt *time.Time
 }
 
 func ParseStream(r io.Reader, maxBytes int64, debug func(string)) (StreamResult, error) {
@@ -49,10 +54,22 @@ func ParseStream(r io.Reader, maxBytes int64, debug func(string)) (StreamResult,
 			out.SessionID = findString(value, "session_id")
 		}
 		m, _ := value.(map[string]any)
-		if m["type"] == "result" {
+		switch m["type"] {
+		case "rate_limit_event":
+			info, _ := m["rate_limit_info"].(map[string]any)
+			out.RateLimitStatus, _ = info["status"].(string)
+			out.RateLimitType, _ = info["rateLimitType"].(string)
+			if seconds, ok := info["resetsAt"].(float64); ok && seconds > 0 {
+				resetAt := time.Unix(int64(seconds), 0).UTC()
+				out.RateLimitResetAt = &resetAt
+			}
+		case "result":
 			out.TerminalSubtype, _ = m["subtype"].(string)
 			out.TerminalReason, _ = m["terminal_reason"].(string)
 			out.TerminalIsError, _ = m["is_error"].(bool)
+			if status, ok := m["api_error_status"].(float64); ok {
+				out.APIErrorStatus = int(status)
+			}
 			if turns, ok := m["num_turns"].(float64); ok {
 				out.NumTurns = int(turns)
 			}

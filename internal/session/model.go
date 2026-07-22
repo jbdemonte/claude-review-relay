@@ -10,6 +10,7 @@ type ReviewStatus string
 const (
 	ReviewStatusPending     ReviewStatus = "pending"
 	ReviewStatusOpen        ReviewStatus = "open"
+	ReviewStatusWaiting     ReviewStatus = "waiting_for_quota"
 	ReviewStatusInterrupted ReviewStatus = "interrupted"
 	ReviewStatusFailed      ReviewStatus = "failed"
 	ReviewStatusClosed      ReviewStatus = "closed"
@@ -21,6 +22,7 @@ type ReviewSession struct {
 	RepositoryPath     string          `json:"repository_path"`
 	Goal               string          `json:"goal"`
 	BaseRef            string          `json:"base_ref"`
+	BaseSHAAtStart     string          `json:"base_sha_at_start,omitempty"`
 	IncludePaths       []string        `json:"include_paths,omitempty"`
 	ExcludePaths       []string        `json:"exclude_paths,omitempty"`
 	HeadSHAAtStart     string          `json:"head_sha_at_start"`
@@ -38,6 +40,9 @@ type ReviewSession struct {
 	LastErrorCode      string          `json:"last_error_code,omitempty"`
 	LastErrorDetails   map[string]any  `json:"last_error_details,omitempty"`
 	LastErrorAt        *time.Time      `json:"last_error_at,omitempty"`
+	RetryAt            *time.Time      `json:"retry_at,omitempty"`
+	RetryOperation     string          `json:"retry_operation,omitempty"`
+	ReviewFocus        []string        `json:"review_focus,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }

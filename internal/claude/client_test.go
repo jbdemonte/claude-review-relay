@@ -63,6 +63,33 @@ func TestParseStreamCapturesTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestParseStreamCapturesRejectedRateLimitAndResetTime(t *testing.T) {
+	stream := `{"type":"system","subtype":"init","session_id":"A"}` + "\n" +
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784718600,"rateLimitType":"five_hour"},"session_id":"A"}` + "\n" +
+		`{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"session_id":"A","terminal_reason":"api_error"}` + "\n"
+	result, err := ParseStream(strings.NewReader(stream), 4096, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReset := time.Unix(1784718600, 0).UTC()
+	if result.SessionID != "A" || result.RateLimitStatus != "rejected" || result.RateLimitType != "five_hour" || result.APIErrorStatus != 429 || result.RateLimitResetAt == nil || !result.RateLimitResetAt.Equal(wantReset) {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestParseStreamKeepsLatestRateLimitStatus(t *testing.T) {
+	stream := `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784718600,"rateLimitType":"five_hour"}}` + "\n" +
+		`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1784737800,"rateLimitType":"five_hour"}}` + "\n"
+	result, err := ParseStream(strings.NewReader(stream), 4096, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReset := time.Unix(1784737800, 0).UTC()
+	if result.RateLimitStatus != "allowed" || result.RateLimitResetAt == nil || !result.RateLimitResetAt.Equal(wantReset) {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestBuildArgsUsesExplicitResumeAndReadOnlyTools(t *testing.T) {
 	args := BuildArgs(Request{SessionID: "A", Prompt: "follow-up", Model: "fable", FallbackModel: "opus", Effort: "max", MaxTurns: 12})
 	joined := strings.Join(args, " ")
@@ -101,6 +128,50 @@ func TestCLIClientProcessFailureAndTimeout(t *testing.T) {
 	_, err = client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", MaxTurns: 1})
 	if !errors.Is(err, ErrTimeout) || !errors.As(err, &runErr) || runErr.Stage != StageProcessExit {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCLIClientClassifiesQuotaBeforeGenericProcessFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
+printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784718600,"rateLimitType":"five_hour"},"session_id":"A"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"session_id":"A","terminal_reason":"api_error"}'
+exit 1
+`
+	client := &CLIClient{Binary: writeScript(t, dir, "quota", script), Timeout: time.Second, MaxOutputBytes: 4096}
+	result, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", Model: "fable", MaxTurns: 1})
+	var runErr *RunError
+	if !errors.Is(err, ErrQuotaExceeded) || !errors.As(err, &runErr) || result.SessionID != "A" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	details := runErr.PublicDetails()
+	if details["api_error_status"] != 429 || details["rate_limit_type"] != "five_hour" || details["retry_at"] != time.Unix(1784718600, 0).UTC().Format(time.RFC3339) {
+		t.Fatalf("details=%v", details)
+	}
+}
+
+func TestCLIClientKeepsSuccessfulOutputAfterRejectedRateLimitEvent(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"A"}'
+printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1784718600,"rateLimitType":"five_hour"},"session_id":"A"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"A","structured_output":{"verdict":"approve","summary":"recovered","findings":[],"missing_tests":[]}}'
+`
+	client := &CLIClient{Binary: writeScript(t, dir, "quota-recovered", script), Timeout: time.Second, MaxOutputBytes: 4096}
+	result, err := client.Run(context.Background(), Request{RepositoryPath: dir, Prompt: "p", Model: "fable", MaxTurns: 1})
+	if err != nil || len(result.StructuredOutput) == 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunErrorDoesNotExposeInformationalRetryAtForOtherFailures(t *testing.T) {
+	retryAt := time.Unix(1784718600, 0).UTC()
+	err := (&RunError{Kind: ErrMaxTurns, RetryAt: &retryAt, RateLimitType: "five_hour"}).PublicDetails()
+	if err["retry_at"] != nil || err["rate_limit_type"] != nil {
+		t.Fatalf("details=%v", err)
 	}
 }
 

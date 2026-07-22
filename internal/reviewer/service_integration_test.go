@@ -186,6 +186,25 @@ type recordingClient struct {
 	requests []claude.Request
 }
 
+type sequenceClient struct {
+	results  []claude.StreamResult
+	errors   []error
+	requests []claude.Request
+}
+
+func (c *sequenceClient) Run(_ context.Context, request claude.Request) (claude.StreamResult, error) {
+	index := len(c.requests)
+	c.requests = append(c.requests, request)
+	var result claude.StreamResult
+	if index < len(c.results) {
+		result = c.results[index]
+	}
+	if index < len(c.errors) {
+		return result, c.errors[index]
+	}
+	return result, nil
+}
+
 func (c *recordingClient) Run(_ context.Context, request claude.Request) (claude.StreamResult, error) {
 	c.requests = append(c.requests, request)
 	return c.result, nil
@@ -258,6 +277,252 @@ func TestInterruptedInitialReviewPersistsSessionAndCanResume(t *testing.T) {
 	record, err = store.Get(context.Background(), reviewID)
 	if err != nil || record.Status != session.ReviewStatusOpen || record.LastErrorCode != "" || record.LastErrorAt != nil || record.TimeoutSeconds != 1200 {
 		t.Fatalf("resumed record=%+v err=%v", record, err)
+	}
+}
+
+func TestQuotaFailureWaitsAndRetriesSameExplicitSession(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Hour)
+	client := &failThenClient{
+		err:         &claude.RunError{Kind: claude.ErrQuotaExceeded, Stage: claude.StageProcessExit, RetryAt: &retryAt, RateLimitType: "five_hour", APIErrorStatus: 429},
+		firstResult: claude.StreamResult{SessionID: "A"},
+		result:      claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"retried","findings":[],"missing_tests":[]}`)},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "high", 10, 240, nil)
+	s.Now = func() time.Time { return now }
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "review quota handling"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusWaiting || status.ClaudeSessionID != "A" || status.LastErrorCode != "claude_quota_exceeded" || status.RetryAt == nil || !status.RetryAt.Equal(retryAt) || status.RetryOperation != "initial" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if status.LastErrorDetails["retry_after_seconds"] != 3600 || status.LastErrorDetails["retryable"] != true {
+		t.Fatalf("details=%v", status.LastErrorDetails)
+	}
+	now = now.Add(30 * time.Minute)
+	status, err = s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.LastErrorDetails["retry_after_seconds"] != 1800 {
+		t.Fatalf("updated status=%+v err=%v", status, err)
+	}
+	_, err = s.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: started.ReviewID, Message: "retry"})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "review_waiting_for_quota" {
+		t.Fatalf("continuation err=%v", err)
+	}
+	_, err = s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: started.ReviewID})
+	if !errors.As(err, &appErr) || appErr.Code != "quota_retry_not_ready" {
+		t.Fatalf("early retry err=%v", err)
+	}
+	retry, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: started.ReviewID, ForceBeforeRetryAt: true, TestResults: "tests passed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ReviewID != started.ReviewID || retry.ClaudeSessionID != "A" || retry.Operation != "quota_retry" || retry.ExpectedResponseSequence != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ClaudeSessionID != "A" || status.Response == nil || status.Response.Summary != "retried" || status.RetryAt != nil || status.RetryOperation != "" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if len(client.requests) != 2 || client.requests[0].SessionID != "" || client.requests[1].SessionID != "A" || !strings.Contains(client.requests[1].Prompt, "tests passed") {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+}
+
+func TestQuotaRetryWithoutSessionReplaysInitialReviewUnderSameReviewID(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Hour)
+	client := &failThenClient{
+		err:    &claude.RunError{Kind: claude.ErrQuotaExceeded, Stage: claude.StageProcessExit, RetryAt: &retryAt, APIErrorStatus: 429},
+		result: claude.StreamResult{SessionID: "B", StructuredOutput: []byte(`{"verdict":"approve","summary":"new session","findings":[],"missing_tests":[]}`)},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "high", 10, 240, nil)
+	s.Now = func() time.Time { return now }
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "original quota goal", ReviewFocus: []string{"correctness"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusWaiting || status.ClaudeSessionID != "" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	persisted, err := store.Get(context.Background(), started.ReviewID)
+	if err != nil || persisted.BaseSHAAtStart == "" {
+		t.Fatalf("persisted=%+v err=%v", persisted, err)
+	}
+	for _, args := range [][]string{{"add", "main.go"}, {"commit", "-m", "commit while quota is unavailable"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	now = retryAt
+	retry, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: started.ReviewID, AdditionalContext: "context after reset"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ReviewID != started.ReviewID || retry.ClaudeSessionID != "" || retry.ExpectedResponseSequence != 1 {
+		t.Fatalf("retry=%+v", retry)
+	}
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ClaudeSessionID != "B" || status.ResponseSequence != 1 {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if len(client.requests) != 2 || client.requests[1].SessionID != "" || client.requests[1].SystemPrompt == "" || !strings.Contains(client.requests[1].Prompt, "original quota goal") || !strings.Contains(client.requests[1].Prompt, "context after reset") || !strings.Contains(client.requests[1].Prompt, "// changed") || !strings.Contains(client.requests[1].Prompt, persisted.BaseSHAAtStart) {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+}
+
+func TestContinuationRefreshUsesPinnedBaseAfterCommit(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &sequenceClient{results: []claude.StreamResult{
+		{SessionID: "A", StructuredOutput: []byte(`{"verdict":"changes_requested","summary":"first","findings":[],"missing_tests":[]}`)},
+		{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"verified","findings":[],"missing_tests":[],"previous_findings":[]}`)},
+	}}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "high", 10, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "verify after commit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	for _, args := range [][]string{{"add", "main.go"}, {"commit", "-m", "commit before verification"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if _, err := s.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: started.ReviewID, Message: "verify committed fixes", RefreshDiff: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	if len(client.requests) != 2 || !strings.Contains(client.requests[1].Prompt, "// changed") {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+}
+
+func TestQuotaDuringContinuationPreservesResponseAndResumesSequence(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Hour)
+	client := &sequenceClient{
+		results: []claude.StreamResult{
+			{SessionID: "A", StructuredOutput: []byte(`{"verdict":"changes_requested","summary":"first","findings":[],"missing_tests":[]}`)},
+			{SessionID: "A"},
+			{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"verified","findings":[],"missing_tests":[],"previous_findings":[]}`)},
+		},
+		errors: []error{nil, &claude.RunError{Kind: claude.ErrQuotaExceeded, Stage: claude.StageProcessExit, RetryAt: &retryAt, APIErrorStatus: 429}, nil},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "high", 10, 240, nil)
+	s.Now = func() time.Time { return now }
+	initial, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test continuation quota"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	if _, err := s.StartContinueReview(context.Background(), ContinueReviewInput{ReviewID: initial.ReviewID, Message: "verify the fixes", RefreshDiff: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), initial.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusWaiting || status.ResponseSequence != 1 || status.Response == nil || status.Response.Summary != "first" || status.RetryOperation != "continuation" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	now = retryAt
+	_, err = s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: initial.ReviewID})
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != "invalid_request" {
+		t.Fatalf("missing message err=%v", err)
+	}
+	retry, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: initial.ReviewID, Message: "verify the fixes after quota reset"})
+	if err != nil || retry.ClaudeSessionID != "A" || retry.ExpectedResponseSequence != 2 {
+		t.Fatalf("retry=%+v err=%v", retry, err)
+	}
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), initial.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ResponseSequence != 2 || status.Response == nil || status.Response.Summary != "verified" || status.ClaudeSessionID != "A" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if len(client.requests) != 3 || client.requests[1].SessionID != "A" || client.requests[2].SessionID != "A" || !strings.Contains(client.requests[2].Prompt, "verify the fixes after quota reset") {
+		t.Fatalf("requests=%+v", client.requests)
+	}
+}
+
+func TestInterruptedQuotaRetryWithoutSessionCanBeReplayedAgain(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	gitClient := gitservice.NewService(1024 * 1024)
+	baseSHA, err := gitClient.ResolveCommit(context.Background(), repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	retryAt := now.Add(-time.Minute)
+	record := session.ReviewSession{ReviewID: "R", RepositoryPath: repo, Goal: "retry", BaseRef: "HEAD", BaseSHAAtStart: baseSHA, Model: "fable", FallbackModel: "opus", Effort: "high", MaxTurns: 10, TimeoutSeconds: 1200, Status: session.ReviewStatusWaiting, RetryAt: &retryAt, RetryOperation: "initial", CreatedAt: now, UpdatedAt: now}
+	if err := store.Create(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	client := &sequenceClient{
+		results: []claude.StreamResult{{}, {SessionID: "B", StructuredOutput: []byte(`{"verdict":"approve","summary":"replayed","findings":[],"missing_tests":[]}`)}},
+		errors:  []error{&claude.RunError{Kind: claude.ErrCanceled, Stage: claude.StageProcessExit}, nil},
+	}
+	s := NewService(store, gitClient, client, "fable", "opus", "high", 10, 240, nil)
+	if _, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: "R"}); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), "R")
+	if err != nil || status.Status != session.ReviewStatusFailed || status.RetryOperation != "initial" || status.LastErrorDetails["retryable"] != true {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if _, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: "R"}); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), "R")
+	if err != nil || status.Status != session.ReviewStatusOpen || status.ClaudeSessionID != "B" || status.Response == nil || status.Response.Summary != "replayed" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestQuotaWithoutResetTimestampAllowsImmediateRetry(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	client := &failThenClient{
+		err:         &claude.RunError{Kind: claude.ErrQuotaExceeded, Stage: claude.StageProcessExit, APIErrorStatus: 429},
+		firstResult: claude.StreamResult{SessionID: "A"},
+		result:      claude.StreamResult{SessionID: "A", StructuredOutput: []byte(`{"verdict":"approve","summary":"immediate","findings":[],"missing_tests":[]}`)},
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), client, "fable", "opus", "high", 10, 240, nil)
+	started, err := s.StartReview(context.Background(), ReviewDiffInput{RepositoryPath: repo, Goal: "test bare 429"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err := s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusWaiting || status.RetryAt != nil {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	if _, err := s.StartRetryReview(context.Background(), RetryReviewInput{ReviewID: started.ReviewID}); err != nil {
+		t.Fatal(err)
+	}
+	s.WaitForWorkers()
+	status, err = s.GetReviewStatus(context.Background(), started.ReviewID)
+	if err != nil || status.Status != session.ReviewStatusOpen || status.Response == nil || status.Response.Summary != "immediate" {
+		t.Fatalf("status=%+v err=%v", status, err)
 	}
 }
 
@@ -621,6 +886,24 @@ func TestRecoverStaleWorkersReconcilesDeadBackgroundWorker(t *testing.T) {
 	}
 	status, err := s.GetReviewStatus(context.Background(), "R")
 	if err != nil || status.Status != session.ReviewStatusFailed || status.ActiveOperation != "" || status.LastErrorCode != "background_worker_stopped" || status.LastErrorDetails["resumable"] != false {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestRecoverStaleQuotaRetryKeepsReplayMetadata(t *testing.T) {
+	repo := integrationRepo(t)
+	store := session.NewJSONStore(filepath.Join(t.TempDir(), "sessions.json"))
+	now := time.Now().UTC()
+	retryAt := now.Add(-time.Minute)
+	if err := store.Create(context.Background(), session.ReviewSession{ReviewID: "R", RepositoryPath: repo, Status: session.ReviewStatusPending, ActiveOperation: "quota_retry", RetryAt: &retryAt, RetryOperation: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewService(store, gitservice.NewService(1024*1024), claude.FailedClient{Err: errors.New("must not run")}, "fable", "opus", "max", 20, 240, nil)
+	if err := s.RecoverStaleWorkers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := s.GetReviewStatus(context.Background(), "R")
+	if err != nil || status.Status != session.ReviewStatusFailed || status.RetryOperation != "initial" || status.LastErrorCode != "background_worker_stopped" || status.LastErrorDetails["retryable"] != true {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
 }

@@ -30,6 +30,7 @@ type GitService interface {
 	UntrackedFiles(context.Context, string, PathScope) ([]string, error)
 	CurrentBranch(context.Context, string) (string, error)
 	HeadSHA(context.Context, string) (string, error)
+	ResolveCommit(context.Context, string, string) (string, error)
 }
 
 type Service struct{ MaxDiffBytes int64 }
@@ -68,14 +69,19 @@ func (s *Service) Root(ctx context.Context, path string) (string, error) {
 }
 
 func (s *Service) validateBase(ctx context.Context, path, base string) error {
-	if base == "" || strings.HasPrefix(base, "-") || strings.ContainsAny(base, "\x00\r\n") {
-		return ErrInvalidBaseRef
+	_, err := s.ResolveCommit(ctx, path, base)
+	return err
+}
+
+func (s *Service) ResolveCommit(ctx context.Context, path, ref string) (string, error) {
+	if ref == "" || strings.HasPrefix(ref, "-") || strings.ContainsAny(ref, "\x00\r\n") {
+		return "", ErrInvalidBaseRef
 	}
-	_, err := run(ctx, path, "rev-parse", "--verify", base+"^{commit}")
+	out, err := run(ctx, path, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidBaseRef, err)
+		return "", fmt.Errorf("%w: %v", ErrInvalidBaseRef, err)
 	}
-	return nil
+	return strings.TrimSpace(out), nil
 }
 
 func (s *Service) Diff(ctx context.Context, path, base string, scope PathScope) (string, error) {
